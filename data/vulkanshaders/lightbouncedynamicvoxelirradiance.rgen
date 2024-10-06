@@ -1,0 +1,329 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_ray_query : require
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (std140, binding = 0) uniform materialData
+{
+    vec4 sceneMinAndCameraVisibleVoxel; //!< Minimum value of the scene's aabb and amount of dynamic visible voxels from the camera in the .w field
+    vec4 sceneExtentAndNumElement;      //!< Extent of the scene and number of elements to be processed by the dispatch
+    vec4 lightPositionAndVoxelSize;     //!< Light position in world coordinates and voxelization resolution in the w component
+    vec4 lightForwardEmitterRadiance;   //!< Forward direction of the light vector, emitter radiance in the .w field
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to store all the dynamically generated voxels that are visible from camera, this buffer has
+* size DynamicVoxelCopyToBufferTechnique::m_maxDynamicVoxel */
+layout (binding = 1) buffer coherent cameraVisibleDynamicVoxelBuffer
+{
+    uint cameraVisibleDynamicVoxel[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for debug purposes */
+layout (binding = 2) buffer coherent dynamicLightBounceDebugBuffer
+{
+    float dynamicLightBounceDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Pointer to buffer with the per voxel face directions (128) to rebuilf the position of the ray intersected */
+layout (binding = 3) buffer coherent rayDirectionBuffer
+{
+    vec4 rayDirection[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to store all the visibility information for each of the camera visible dynamic voxels present in the 
+* cameraVisibleDynamicVoxelBuffer buffer */
+layout (binding = 4) buffer coherent dynamicVoxelVisibilityBuffer
+{
+    uint dynamicVoxelVisibility[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// Acceleration structures
+layout(binding = 5) uniform accelerationStructureEXT raytracedaccelerationstructure;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+struct hitPayload
+{
+    vec3 hitPosition;
+    vec3 hitNormal;
+    int isDynamicGeometry;
+    int anyHit;
+    int isShadowRay;
+};
+
+layout(location = 0) rayPayloadEXT hitPayload prd;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// DEFINES
+#define NUMBER_DIRECTION                    6
+#define NUMBER_DESIRED_POINT              128
+#define NUMBER_THREAD_PER_LOCAL_WORKGROUP  64
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+vec3  g_sceneExtent;             //!< Scene extent
+vec3  g_sceneMin;                //!< Scene min
+float g_voxelSize;               //!< Size of the voxelization texture
+vec3  g_emitterPosition;         //!< Emitter position in world coordinates
+vec3  g_emitterForwardDirection; //!< Emitter direction
+float g_tMin;                    //!< Min parameter for ray tracing and ray query
+float g_tMax;                    //!< Max parameter for ray tracing and ray query
+
+bool record;
+uint counter;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+vec3 arrayDirections[NUMBER_DIRECTION] = {
+    vec3(-1.0,  0.0,  0.0),
+    vec3( 1.0,  0.0,  0.0),
+    vec3( 0.0, -1.0,  0.0),
+    vec3( 0.0,  1.0,  0.0),
+    vec3( 0.0,  0.0, -1.0),
+    vec3( 0.0,  0.0,  1.0)
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+ivec3 unhashValue(uint value)
+{
+    float number     = float(value) / g_voxelSize;
+
+    ivec3 result;
+    float integerPart;
+    float fractional = modf(number, integerPart);
+    result.z         = int(fractional * g_voxelSize);
+    number          /= g_voxelSize;
+    fractional       = modf(number, integerPart);
+    result.y         = int(fractional * g_voxelSize);
+    result.x         = int(integerPart);
+
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes world space coordinates for 3D texture coordinates
+* @param coordinates [in] texture coordinates
+* @return world coordinates of the voxel coordinates given as parameter */
+vec3 voxelSpaceToWorld(ivec3 coordinates)
+{
+    vec3 result = vec3(float(coordinates.x), float(coordinates.y), float(coordinates.z));
+    result     /= vec3(g_voxelSize);
+    result     *= g_sceneExtent;
+    result     += g_sceneMin;
+    result     += (g_sceneExtent / g_voxelSize) * 0.5;
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+bool emitterVisibleQuery(vec3 worldPosition)
+{
+    vec3 worldToEmitterDirection = g_emitterPosition - worldPosition;
+    float tMax                   = length(worldToEmitterDirection);
+    worldToEmitterDirection      = normalize(g_emitterPosition);
+
+    // The current approach for the emitter is a directional one, with the vector from the origin to his position being the light direction
+    vec3 lightDirection = normalize(g_emitterPosition);
+    if(dot(lightDirection, worldToEmitterDirection) <= 0.0)
+    {
+        return false;
+    }
+
+    // Initializes a ray query object but does not start traversal
+    rayQueryEXT rayQuery;
+    rayQueryInitializeEXT(rayQuery, raytracedaccelerationstructure, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, worldPosition, g_tMin, worldToEmitterDirection, tMax);
+
+    // First ray query is done with the scene static goemetry
+    while(rayQueryProceedEXT(rayQuery))
+    {
+    }
+
+    // In case of intersection, something was visible and not the emitter
+    if(rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionNoneEXT)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+////////////////////////////////////////////////////////////////////////////////////
+
+/** Encode a normal with information in the first 16 bits of a 32-bit uint
+* with bits 0-6 for the x component, bit 7-13 for the y component, and bit 14 for the
+* z component sign (value 0 means negative, value 1, positive)
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __
+* 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __
+*    |s||   y component     ||   x component    |
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __
+* @param normal [in] normal direction to encode
+* @return compressed normal direction */
+uint encodeNormalXYFloatToUInt7Bit(vec3 normal)
+{
+    vec2 resultFloat = vec2(normal.x * 0.5 + 0.5, normal.y * 0.5 + 0.5);
+    resultFloat     *= 127.0;
+    resultFloat.x    = clamp(resultFloat.x, 0.0, 127.0);
+    resultFloat.y    = clamp(resultFloat.y, 0.0, 127.0);
+    uint xValue      = uint(resultFloat.x);
+    uint yValue      = uint(resultFloat.y);
+
+    uint result = xValue | (yValue << 7);
+    if (normal.z > 0.0)
+    {
+        result |= 0x00004000;
+    }
+
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Encode in a 4 bytes uint the distance value (from the voxel center to the hit position) as a 16 bit
+* float (in the bits 16-31) and a 7 bit integer approximation of the x and y normal direction components
+* in the bits 0-14. Bit 15 is a flag to know if the intersected geometry is dynamic.
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __
+* 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __
+* |d||s||   y component     ||   x component    |
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __
+* @param distanceValue [in] distance value to encode
+* @param hitNormal     [in] normal direction to encode
+* @return encoded values */
+uint encodeHitInformation(float distanceValue, vec3 hitNormal, bool isDynamicGeometry)
+{
+    uint normalData   = encodeNormalXYFloatToUInt7Bit(hitNormal);
+    uint distanceData = packHalf2x16(vec2(0.0, distanceValue));
+
+    if (isDynamicGeometry)
+    {
+        normalData |= 0x00008000;
+    }
+
+    return distanceData | normalData;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Shadow ray test from origin given parameter
+* @param rayOrigin [in] ray origin position
+* @return true if the shadow ray hit a geometry, false otherwise */
+bool shadowRay(vec3 rayOrigin)
+{
+    prd.hitPosition       = vec3(0.0);
+    prd.hitNormal         = vec3(0.0);
+    prd.isDynamicGeometry = 0;
+    prd.anyHit            = 0;
+    prd.isShadowRay       = 1;
+    vec3 direction        = g_emitterPosition - rayOrigin;
+    float tMax            = length(direction);
+    direction             = normalize(direction);
+
+    traceRayEXT(raytracedaccelerationstructure, // acceleration structure
+            gl_RayFlagsOpaqueEXT,               // rayFlags
+            0xFF,                               // cullMask
+            0,                                  // sbtRecordOffset
+            0,                                  // sbtRecordStride
+            0,                                  // missIndex
+            rayOrigin,                          // ray origin
+            g_tMin,                             // ray min range
+            direction,                          // ray direction
+            tMax,                               // ray max range
+            0                                   // payload (location = 0)
+    );
+
+    return (prd.anyHit == 1);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+void main()
+{
+    int voxelIndex                  = int(gl_LaunchIDEXT.x);
+    int faceIndex                   = int(gl_LaunchIDEXT.y);
+    int directionIndex              = int(gl_LaunchIDEXT.z);
+    uint textVoxelHashedPosition    = cameraVisibleDynamicVoxel[voxelIndex];
+    g_voxelSize                     = myMaterialData.lightPositionAndVoxelSize.w;
+    ivec3 voxelTextureCoordinates   = unhashValue(textVoxelHashedPosition);
+    g_sceneExtent                   = myMaterialData.sceneExtentAndNumElement.xyz;
+    g_sceneMin                      = myMaterialData.sceneMinAndCameraVisibleVoxel.xyz;
+    vec3 voxelWorldCoordinates      = voxelSpaceToWorld(voxelTextureCoordinates);
+    float voxelWorldHalfSide        = (g_sceneExtent.x / g_voxelSize) * 0.5;
+    vec3 rayOrigin                  = voxelWorldCoordinates + arrayDirections[faceIndex] * voxelWorldHalfSide;
+    g_tMin                          = length(voxelWorldHalfSide) * (DYNAMIC_VOXEL_RT_TMIN_MULTIPLIER / 100.0);
+    g_tMax                          = float(MAX_DYNAMIC_RT_RAY_LENGTH);
+    g_emitterPosition               = myMaterialData.lightPositionAndVoxelSize.xyz;
+    g_emitterForwardDirection       = myMaterialData.lightForwardEmitterRadiance.xyz;
+
+    record  = false;
+    counter = 0;
+
+    vec3 rayDirectionValue = rayDirection[faceIndex * 128 + directionIndex].xyz;
+    prd.hitPosition        = vec3(0.0);
+    prd.hitNormal          = vec3(0.0);
+    prd.isDynamicGeometry  = 0;
+    prd.anyHit             = 0;
+    prd.isShadowRay        = 0;
+
+    traceRayEXT(raytracedaccelerationstructure, // acceleration structure
+            gl_RayFlagsOpaqueEXT,               // rayFlags
+            0xFF,                               // cullMask
+            0,                                  // sbtRecordOffset
+            0,                                  // sbtRecordStride
+            0,                                  // missIndex
+            rayOrigin,                          // ray origin
+            g_tMin,                             // ray min range
+            rayDirectionValue,                  // ray direction
+            g_tMax,                             // ray max range
+            0                                   // payload (location = 0)
+    );
+
+    // Only storing information in case there is a geometry intersection and the emitter is visible from the hit point
+    if(prd.anyHit == 1)
+    {
+        if(emitterVisibleQuery(prd.hitPosition))
+        {
+            int startIndex                     = voxelIndex * int(NUMBER_DESIRED_POINT) * NUMBER_DIRECTION + faceIndex * int(NUMBER_DESIRED_POINT);
+            int writeIndex                     = startIndex + directionIndex;
+            uint encodedValue                  = encodeHitInformation(distance(rayOrigin, prd.hitPosition), prd.hitNormal, (prd.isDynamicGeometry == 1));
+            dynamicVoxelVisibility[writeIndex] = encodedValue; // Each update all dynamicVoxelVisibility values are reset to 0 so no-intersection cases are not stored
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

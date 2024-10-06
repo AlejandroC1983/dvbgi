@@ -1,0 +1,74 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#extension GL_EXT_ray_tracing : require
+
+layout (std140, binding = 0) uniform sceneCamera
+{
+    mat4 view;
+    mat4 projection;
+    vec4 sceneOffset;
+    vec4 sceneExtent;
+} mySceneCamera;
+
+layout(binding = 1) uniform accelerationStructureEXT raytracedaccelerationstructurecamera;
+layout(binding = 2, rgba16f) uniform image2D raytracingoffscreen;
+
+const vec3 cameraPosition = vec3(4.94999981, 3.00900006, 6.34000015);
+
+struct hitPayload
+{
+    vec3 cameraPosition;
+    float distance;
+};
+
+layout(location = 0) rayPayloadEXT hitPayload prd;
+
+void main()
+{
+  const vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+  const vec2 inUV        = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
+  vec2  d                = inUV * 2.0 - 1.0;
+
+  mat4 viewInverse       = inverse(mySceneCamera.view);
+  mat4 projectionInverse = inverse(mySceneCamera.projection);
+
+  vec4 origin            = viewInverse       * vec4(0, 0, 0, 1);
+  vec4 target            = projectionInverse * vec4(d.x, d.y, 1, 1);
+  vec4 direction         = viewInverse       * vec4(normalize(target.xyz), 0);
+  uint  rayFlags         = gl_RayFlagsOpaqueEXT;
+  float tMin             = 0.001;
+  float tMax             = 10000.0;
+
+  prd.cameraPosition     = cameraPosition;
+  prd.distance           = -1.0;
+
+  traceRayEXT(raytracedaccelerationstructurecamera, // acceleration structure
+              rayFlags,                       // rayFlags
+              0xFF,                           // cullMask
+              0,                              // sbtRecordOffset
+              0,                              // sbtRecordStride
+              0,                              // missIndex
+              origin.xyz,                     // ray origin
+              tMin,                           // ray min range
+              direction.xyz,                  // ray direction
+              tMax,                           // ray max range
+              0                               // payload (location = 0)
+  );
+
+    imageStore(raytracingoffscreen, ivec2(gl_LaunchIDEXT.xy), vec4(prd.distance, prd.distance, prd.distance, 1.0));
+}

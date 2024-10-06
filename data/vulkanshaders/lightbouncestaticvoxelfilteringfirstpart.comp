@@ -1,0 +1,415 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#extension GL_EXT_shader_8bit_storage : enable
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+  // WARNING 4 32-bit ALLIGNMENT
+  uint localWorkGroupsXDimension; //!< Dispatch command x dimension size
+  uint localWorkGroupsYDimension; //!< Dispatch command y dimension size
+  uint numThreadExecuted;         //!< Number thread executed
+  uint voxelizationSize;          //!< Size of the voxelization texture
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Shader storage buffer with the irradiance at each major axis direction */
+layout (binding = 1) buffer coherent lightBounceVoxelIrradianceBuffer
+{
+    uint lightBounceVoxelIrradiance[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Shader storage buffer used as a temporal copy of lightBounceVoxelIrradianceBuffer when 
+* performing the gaussian blur passes with 3^3 kernel size */
+layout (binding = 2) buffer coherent lightBounceVoxelIrradianceTempBuffer
+{
+    uint lightBounceVoxelIrradianceTemp[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used to store the indices of the tiles that need to be processed for the filtering computation */
+layout (binding = 3) buffer coherent irradianceFilteringTagTilesIndexBuffer
+{
+    uint irradianceFilteringTagTilesIndex[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 4) buffer coherent voxelOccupiedBuffer
+{
+   uint voxelOccupied[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** buffer for debug purposes */
+layout (binding = 5) buffer coherent staticVoxelFilteringDebugBuffer
+{
+   double staticVoxelFilteringDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Push constant to know what xis is currnelty used for the Gaussian separable filtering */
+layout(push_constant) uniform pushConstant
+{
+    vec4 pushConstantFilterCurrentAxis;
+} myPushConstant;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// Image load / store
+layout(binding = 6,  r11f_g11f_b10f) uniform writeonly image3D irradiance3DStaticNegativeX;
+layout(binding = 7,  r11f_g11f_b10f) uniform writeonly image3D irradiance3DStaticPositiveX;
+layout(binding = 8,  r11f_g11f_b10f) uniform writeonly image3D irradiance3DStaticNegativeY;
+layout(binding = 9,  r11f_g11f_b10f) uniform writeonly image3D irradiance3DStaticPositiveY;
+layout(binding = 10, r11f_g11f_b10f) uniform writeonly image3D irradiance3DStaticNegativeZ;
+layout(binding = 11, r11f_g11f_b10f) uniform writeonly image3D irradiance3DStaticPositiveZ;
+
+// Sampling
+layout(binding = 12) uniform usampler3D staticVoxelIndexTexture;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// DEFINES
+#define NUMBER_VOXEL_NEIGHBOUR                  27
+#define NUMBER_VOXEL_FACE                        6
+#define NUMBER_THREAD_LOCAL_WORKGROUP            8
+#define NUMBER_AXIS                              3
+#define NUMBER_LOAD_PER_AXIS                     8
+#define NUMBER_NEIGHBOUR_SAMPLE_FILTERING        2
+#define PI                                       3.14159265359
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+int   g_voxelSizeInt;   //!< Size of the voxelization texture
+float g_voxelSizeFloat; //!< Size of the voxelization texture
+const uint g_maxValue = 4294967295;
+
+// SHARED VARIABLES
+shared uint s_tileIndex;                                                    //!< Index of the tile to be analysed in the local workgroup
+shared vec3 s_irradianceInfo[TILE_SIDE + 2][TILE_SIDE + 2][TILE_SIDE + 2];  //!< Shared variable with the irradiance information of all occupied voxels inside the tile and for all voxels around it (i.e., if the tile has size 2^3, the irraidance ifnromation will be loaded for all those voxels and all the neighbours, in a set of (2 + 2)^3 voxels)
+shared bool s_tileVoxelIsOccupied[TILE_SIDE + 2][TILE_SIDE + 2][TILE_SIDE + 2];         //!< Shared variable to store whether each voxel in the tile being processed is occupied or empty regarding static voxels. The indices [0, ..., TILE_SIZE_TOTAL - 1] map with offsets arrayTileNeighbourCoordinates[0], ..., arrayTileNeighbourCoordinates[TILE_SIZE_TOTAL - 1] from the base tile coordinates transformed into voxel coordinates*/
+
+bool record;
+uint counter;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array offsets to know the coordinates of any voxel within the current tile */
+ivec3 arrayTileNeighbourCoordinates[TILE_SIZE_TOTAL] = 
+{
+    ivec3( 0,  0,  0), // i = 0, j = 0, k = 0, index = 0, 4*i * + 2*j + k
+    ivec3( 0,  0,  1), // i = 0, j = 0, k = 1, index = 1
+    ivec3( 0,  1,  0), // i = 0, j = 1, k = 0, index = 2
+    ivec3( 0,  1,  1), // i = 0, j = 1, k = 1, index = 3
+    ivec3( 1,  0,  0), // i = 1, j = 0, k = 0, index = 4
+    ivec3( 1,  0,  1), // i = 1, j = 0, k = 1, index = 5
+    ivec3( 1,  1,  0), // i = 1, j = 1, k = 0, index = 6
+    ivec3( 1,  1,  1)  // i = 1, j = 1, k = 1, index = 7
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array of offsets to load irradiance into s_irradianceInfo for just the voxels required by each 
+* filtering pass (x axis, y axis, z axis) using as reference the coordinates (1, 1, 1) in arrayAxisLoadOffset which 
+* correspond to coordinates (0, 0, 0) of the tile / set of voxels being processed (take 
+* into account that a shell of 1 voxels is considered around the tile of size TILE_SIDE^3 */
+ivec3 arrayAxisLoadOffset[NUMBER_AXIS][NUMBER_LOAD_PER_AXIS] = 
+{
+    {ivec3(-1,  0,  0), ivec3(-1,  0,  1), ivec3(-1,  1,  0), ivec3(-1,  1,  1), ivec3( 2,  0,  0), ivec3( 2,  0,  1), ivec3( 2,  1,  0), ivec3( 2,  1,  1)}, // x axis pass
+    {ivec3( 0, -1,  0), ivec3( 0, -1,  1), ivec3( 1, -1,  0), ivec3( 1, -1,  1), ivec3( 0,  2,  0), ivec3( 0,  2,  1), ivec3( 1,  2,  0), ivec3( 1,  2,  1)}, // y axis pass
+    {ivec3( 0,  0, -1), ivec3( 0,  1, -1), ivec3( 1,  0, -1), ivec3( 1,  1, -1), ivec3( 0,  0,  2), ivec3( 0,  1,  2), ivec3( 1,  0,  2), ivec3( 1,  1,  2)}, // z axis pass
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array of offsets to load irradiance from s_irradianceInfo for the filtering computations */
+ivec3 arrayAxisSampleOffset[NUMBER_AXIS][NUMBER_NEIGHBOUR_SAMPLE_FILTERING] = 
+{
+    {ivec3(-1,  0,  0), ivec3( 1,  0,  0)}, // x axis pass
+    {ivec3( 0, -1,  0), ivec3( 0,  1,  0)}, // y axis pass
+    {ivec3( 0,  0, -1), ivec3( 0,  0,  1)}, // z axis pass
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array offsets to store the result of the padding mean value for each not occupied voxel neighbour around a voxel in a 3^3 neighbourhood */
+ivec3 arrayNeighbourCoordinates[NUMBER_VOXEL_NEIGHBOUR] = 
+{
+    ivec3(-1, -1, -1),
+    ivec3(-1, -1,  0),
+    ivec3(-1, -1,  1),
+    ivec3(-1,  0, -1),
+    ivec3(-1,  0,  0),
+    ivec3(-1,  0,  1),
+    ivec3(-1,  1, -1),
+    ivec3(-1,  1,  0),
+    ivec3(-1,  1,  1),
+    ivec3( 0, -1, -1),
+    ivec3( 0, -1,  0),
+    ivec3( 0, -1,  1),
+    ivec3( 0,  0, -1),
+    ivec3( 0,  0,  0),
+    ivec3( 0,  0,  1),
+    ivec3( 0,  1, -1),
+    ivec3( 0,  1,  0),
+    ivec3( 0,  1,  1),
+    ivec3( 1, -1, -1),
+    ivec3( 1, -1,  0),
+    ivec3( 1, -1,  1),
+    ivec3( 1,  0, -1),
+    ivec3( 1,  0,  0),
+    ivec3( 1,  0,  1),
+    ivec3( 1,  1, -1),
+    ivec3( 1,  1,  0),
+    ivec3( 1,  1,  1),
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Precomputed values of Gaussian distribution in 3D for x, y, z in {-1, 0, 1} and sigma 25.0 */
+float precomputedGaussianWeight[NUMBER_VOXEL_NEIGHBOUR] =
+{
+    0.000254037, // (x=-1, y=-1, z=-1)
+    0.000254241, // (x=-1, y=-1, z=0)
+    0.000254037, // (x=-1, y=-1, z=1)
+    0.000254241, // (x=-1, y=0, z=-1)
+    0.000254444, // (x=-1, y=0, z=0)
+    0.000254241, // (x=-1, y=0, z=1)
+    0.000254037, // (x=-1, y=1, z=-1)
+    0.000254241, // (x=-1, y=1, z=0)
+    0.000254037, // (x=-1, y=1, z=1)
+    0.000254241, // (x=0, y=-1, z=-1)
+    0.000254444, // (x=0, y=-1, z=0)
+    0.000254241, // (x=0, y=-1, z=1)
+    0.000254444, // (x=0, y=0, z=-1)
+    0.000254648, // (x=0, y=0, z=0)
+    0.000254444, // (x=0, y=0, z=1)
+    0.000254241, // (x=0, y=1, z=-1)
+    0.000254444, // (x=0, y=1, z=0)
+    0.000254241, // (x=0, y=1, z=1)
+    0.000254037, // (x=1, y=-1, z=-1)
+    0.000254241, // (x=1, y=-1, z=0)
+    0.000254037, // (x=1, y=-1, z=1)
+    0.000254241, // (x=1, y=0, z=-1)
+    0.000254444, // (x=1, y=0, z=0)
+    0.000254241, // (x=1, y=0, z=1)
+    0.000254037, // (x=1, y=1, z=-1)
+    0.000254241, // (x=1, y=1, z=0)
+    0.000254037, // (x=1, y=1, z=1)
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the tile 3D position given with hashed value as parameter
+* @param value [in] tile index value to unhash
+* @return unhashed tile value for parameter value */
+ivec3 unhashTileValue(uint value)
+{
+    float voxelSizeHalf = g_voxelSizeFloat / float(TILE_SIDE);
+    float number        = float(value) / voxelSizeHalf;
+
+    ivec3 result;
+    float integerPart;
+    float fractional = modf(number, integerPart);
+    result.z         = int(fractional * voxelSizeHalf);
+    number          /= voxelSizeHalf;
+    fractional       = modf(number, integerPart);
+    result.y         = int(fractional * voxelSizeHalf);
+    result.x         = int(integerPart);
+
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+ivec3 unhashValue(uint value, uint voxelSize)
+{
+    float voxelSizeFloat = float(voxelSize);
+    float number     = float(value) / voxelSizeFloat;
+
+    ivec3 result;
+    float integerPart;
+    float fractional = modf(number, integerPart);
+    result.z         = int(fractional * voxelSizeFloat);
+    number          /= voxelSizeFloat;
+    fractional       = modf(number, integerPart);
+    result.y         = int(fractional * voxelSizeFloat);
+    result.x         = int(integerPart);
+
+    return result;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Does the integer modulo operation x mod(y) returning the interger result
+* @param x [in] value to apply module to
+* @param y [in] value to apply module with
+* @return retul of the operation x mod(y) */
+double modulo(double x, double y)
+{
+    return x - (y * floor(x / y));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupied if the current voxel is occupied by at least one fragment, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupied(uint indexHashed)
+{
+    float integerPart;
+    float indexDecimalFloat = float(indexHashed) / 32.0;
+    float fractional        = modf(indexDecimalFloat, integerPart);
+    uint index              = uint(integerPart);
+    uint bit                = uint(fractional * 32.0);
+    bool result             = ((voxelOccupied[index] & (1 << bit)) > 0);
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** hashed value for texture coordinates given as parameter in a voxelization of size given by g_voxelSizeInt
+* @param texcoord  [in] texture coordinates
+* @param voxelSize [in] voxelization size
+* @return hashed value */
+uint getHashedIndex(ivec3 texcoord)
+{
+    return uint(texcoord.x * g_voxelSizeInt * g_voxelSizeInt + texcoord.y * g_voxelSizeInt + texcoord.z);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Utility function to encapsulate the irradiance loading from the lightBounceVoxelIrradianceBuffer. 
+* The irradiance to be loaded is assumed to be from a static occupied voxel.
+* @param coordinates [in] voxel coordinates to load irradiance from
+* @param voxelFace   [in] voxel coordinates face to load irradiance from
+* @return loaded irradiance */
+vec3 loadIrradiance(ivec3 coordinates, uint voxelFace)
+{
+    uint index            = texelFetch(staticVoxelIndexTexture, coordinates, 0).r;
+    index                 = 12 * index + 2 * voxelFace;
+    uint xyComponent      = lightBounceVoxelIrradiance[index + 0];
+    uint zComponent       = lightBounceVoxelIrradiance[index + 1];
+    vec2 xyComponentFloat = unpackHalf2x16(xyComponent);
+    vec2 zComponentFloat  = unpackHalf2x16(zComponent);
+
+    return vec3(xyComponentFloat.x, xyComponentFloat.y, zComponentFloat.x);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Store irradiance information for the coordinates and voxel face given into the corresponding texture for static voxels
+* @param faceIndex   [in] face index for the texture where to store irradiance information
+* @param coordinates [in] texture coordinates where to store the irradiance
+* @param irradiance  [in] irradiance value to store
+* @return nothing */
+void storeStaticIrradianceInformation(uint faceIndex, ivec3 coordinates, vec3 irradiance)
+{
+    switch (faceIndex)
+    {
+        case 0:
+        {
+            imageStore(irradiance3DStaticNegativeX, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 1:
+        {
+            imageStore(irradiance3DStaticPositiveX, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 2:
+        {
+            imageStore(irradiance3DStaticNegativeY, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 3:
+        {
+            imageStore(irradiance3DStaticPositiveY, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 4:
+        {
+            imageStore(irradiance3DStaticNegativeZ, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 5:
+        {
+            imageStore(irradiance3DStaticPositiveZ, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+    };
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Utility function to encapsulate the irradiance storing . The irradiance to be stored is 
+* assumed to be from a static occupied voxel.
+* @param irradiance  [in] irradiance value to store
+* @param voxelFace   [in] voxel coordinates face to store irradiance from
+* @param coordinates [in] voxel coordinates to store irradiance from
+* @return nothing */
+void storeIrradiance(vec3 irradiance, uint voxelFace, ivec3 coordinates)
+{
+    // TODO: Cache values sampled from staticVoxelIndexTexture to avoid repeating the same sample
+    uint xyComponent = packHalf2x16(vec2(irradiance.xy));
+    uint zComponent  = packHalf2x16(vec2(irradiance.z, 0.0));
+
+    uint index       = texelFetch(staticVoxelIndexTexture, coordinates, 0).r;
+    index            = 12 * index + 2 * voxelFace;
+
+    // For x and z axis pass, read from lightBounceVoxelIrradiance and store in lightBounceVoxelIrradianceTemp
+    // The next dispatch to perform static voxel padding will read information from lightBounceVoxelIrradianceTemp
+    lightBounceVoxelIrradianceTemp[index + 0] = xyComponent;
+    lightBounceVoxelIrradianceTemp[index + 1] = zComponent;
+
+    // Write the final filtered values into the static voxel 3D irradiance textures
+    storeStaticIrradianceInformation(voxelFace, coordinates, irradiance);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Gaussian distribution for x, y, and z parameters, for sigma given also by parameter
+* @param x     [in] x value to compute Gaussian distribution
+* @param y     [in] x value to compute Gaussian distribution
+* @param z     [in] x value to compute Gaussian distribution
+* @param sigma [in] sigma value to compute Gaussian distribution
+* @return Gaussian distribution value */
+float gaussianDistribution3D(float x, float y, float z, float sigma)
+{
+    float denominator    = 2.0 * PI * sigma * sigma;
+    float expNumerator   = x * x + y * y + z * z;
+    float expDenominator = 2.0 * sigma * sigma;
+
+    return (1.0 / denominator) * exp(-1.0 * (expNumerator / expDenominator));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

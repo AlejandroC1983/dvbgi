@@ -1,0 +1,123 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+	const uint NUM_WORKGROUP_Y_DIMENSION = myMaterialData.localWorkGroupsYDimension;
+	uint idx                             = gl_WorkGroupID.x * NUM_WORKGROUP_Y_DIMENSION * THREAD_PER_LOCAL_WORKGROUP + gl_WorkGroupID.y * THREAD_PER_LOCAL_WORKGROUP + gl_LocalInvocationIndex;
+
+	bool testingStaticVoxel     = (int(myPushConstant.pushConstantIsTestingStaticVoxel.x) == 1) ? true : false;
+	uint numOccupiedVoxel       = uint(myPushConstant.pushConstantIsTestingStaticVoxel.y);
+
+	// NOTE: Each thread must test 32 elements to flag the results at bit level in litTextVoxelPerBitBuffer
+
+	uint startIndex             = idx * ELEMENT_PER_THREAD;
+	uint endIndex               = min(startIndex + ELEMENT_PER_THREAD, numOccupiedVoxel);
+	g_sceneExtent               = myMaterialData.sceneExtent.xyz;
+	g_voxelSize                 = myMaterialData.voxelSize;
+    g_lightPosition             = myMaterialData.lightPosition.xyz;
+    g_sceneMin                  = myMaterialData.sceneMin.xyz;
+	ivec3 minLitBoundaries      = ivec3(LIT_VOXEL_MIN_COORDINATE_X, LIT_VOXEL_MIN_COORDINATE_Y, LIT_VOXEL_MIN_COORDINATE_Z);
+	ivec3 maxLitBoundaries      = ivec3(LIT_VOXEL_MAX_COORDINATE_X, LIT_VOXEL_MAX_COORDINATE_Y, LIT_VOXEL_MAX_COORDINATE_Z);
+	vec3 voxelSizeWorld         = (g_sceneExtent / g_voxelSize) * 0.5;
+	float maxVoxelSizeWorld     = max(voxelSizeWorld.x, max(voxelSizeWorld.y, voxelSizeWorld.z));
+	
+	uvec3 voxelTextureCoordinates;
+	vec3 pos;
+    uint voxelHashedPosition;
+	uint i;
+	uint j;
+
+	record = false;
+
+	for(i = startIndex; i < endIndex; ++i)
+	{
+		if(testingStaticVoxel)
+		{
+			voxelHashedPosition = voxelHashedPositionCompacted[i];
+		}
+		else
+		{
+			voxelHashedPosition = dynamicVoxel[i];
+		}
+
+		voxelTextureCoordinates = unhashValue(voxelHashedPosition);
+
+		// Avoid to analyze voxels outside the voxel textuee coordinates given by LIT_VOXEL_MIN_COORDINATE_* and LIT_VOXEL_MAX_COORDINATE_*
+		bvec3 smaller = lessThan(   voxelTextureCoordinates, minLitBoundaries);
+		bvec3 greater = greaterThan(voxelTextureCoordinates, maxLitBoundaries);
+			
+		if(any(smaller) || any(greater))
+		{
+			continue;
+		}
+
+		pos = voxelSpaceToWorld(voxelTextureCoordinates);
+
+		generateTestingPoints(pos);
+
+		int numNoIntersection = 0;
+
+		for(int j = 0; j < 8; ++j)
+		{
+			vec3 testPoint = g_arrayTestPoint[j];
+			vec3 direction = normalize(g_lightPosition);
+			float tMin     = maxVoxelSizeWorld; // Gioves light leak for Cornell, using parameterized value
+			float tMax     = length(g_lightPosition - testPoint);
+
+			// The current approach for the emitter is a directional one, with the vector from the origin to his position being the light direction
+		    vec3 lightDirection = normalize(myMaterialData.lightPosition.xyz);
+		    if(dot(direction, lightDirection) <= 0.0)
+		    {
+		        continue;
+		    }
+
+			bool rayNoIntersection = true;
+
+			rayQueryEXT rayQuery;
+			rayQueryInitializeEXT(rayQuery, raytracedaccelerationstructure, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, testPoint, tMin, direction, tMax);
+
+			// Start traversal: return false if traversal is complete
+			while(rayQueryProceedEXT(rayQuery))
+			{
+			}
+
+			// Returns type of committed (true) intersection
+			if(rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionNoneEXT)
+			{
+      			rayNoIntersection = false;
+  			}
+
+  			if(rayNoIntersection)
+  			{
+  				numNoIntersection++;
+  			}
+		}
+
+		if(numNoIntersection > 1)
+		{
+			if(testingStaticVoxel)
+			{
+				setVoxelFaceLit(voxelHashedPosition);
+			}
+			else
+			{
+				setDynamicVoxelFaceLit(voxelHashedPosition);
+			}
+		}
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////

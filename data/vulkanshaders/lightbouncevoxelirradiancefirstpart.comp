@@ -1,0 +1,1234 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#extension GL_EXT_ray_query : enable
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+	// WARNING 4 32-bit ALLIGNMENT
+	uint localWorkGroupsXDimension;    //!< Dispatch command x dimension size
+	uint localWorkGroupsYDimension;    //!< Dispatch command y dimension size
+	uint numThreadExecuted;            //!< Number of thread dispatched
+	uint numberThreadPerElement;       //!< Number of thread needed per element
+	vec4 sceneMinAndNumberVoxel;       //!< Scene min and number voxel in w field
+	vec4 sceneExtentAndVoxelSize;      //!< Extent of the scene in the xyz coordinates, voxelization texture size in the w coordinate
+	vec4 lightPosition;                //!< Light position in world coordinates, (formFactorVoxelToVoxelAdded in the w component, equivalent to FORM_FACTOR_VOXEL_TO_VOXEL_ADDED)
+	vec4 lightForwardEmitterRadiance;  //!< Light forward direction in xyz components, emitter radiance in w component
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 1) buffer coherent voxelOccupiedBuffer
+{
+	uint voxelOccupied[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/* Buffer for debug purposes */
+layout (binding = 2) buffer coherent lightBounceVoxelDebugBuffer
+{
+	float lightBounceVoxelDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Shader storage buffer with the irradiance at each major axis direction */
+layout (binding = 3) buffer coherent lightBounceVoxelIrradianceBuffer
+{
+	uint lightBounceVoxelIrradiance[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// Buffer where to flag whether a voxel is visible from the camera as in m_cameraVisibleVoxelBuffer but with all the visible
+// from camera voxel hashed indices starting from index 0
+layout (binding = 4) buffer coherent cameraVisibleVoxelCompactedBuffer
+{
+	uint cameraVisibleVoxelCompacted[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used ot tag whether a voxel has been processed to compute irradiance arriving at each of its six faces. */
+layout (binding = 5) buffer coherent lightBounceProcessedVoxelBuffer
+{
+	float lightBounceProcessedVoxel[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// NOTE: Is this buffer really needed?
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 6) buffer coherent voxelOccupiedDynamicBuffer
+{
+	uint voxelOccupiedDynamic[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the dynamic voxel vsibility information: For each voxel face, 4 uint elements
+* are considered to tag as static (0) / dynamic (1) visible voxels for the corresponding voxel
+* face, mapping up to 128 voxel face rays (curently 36 are being used). */
+layout (binding = 7) buffer coherent dynamicVoxelVisibilityFlagBuffer
+{
+    uint dynamicVoxelVisibilityFlag[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer of lit test voxels having information on a per-byte approach (each byte has information on whether any 
+* voxel face is lit and what voxel faces are lit at bit level, with info [no info][-x][+x][-y][+y][-z][+z][AnyLitVoxelFace]) */
+layout (binding = 8) buffer coherent litTestVoxelPerByteBuffer
+{
+	uint8_t litTestVoxelPerByte[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer having for each set of m_numThreadPerLocalWorkgroup elements and for each voxel face, the distance 
+* from the current voxel for each sampling direction of any dynamic intersected geometry (2 bytes) as
+* well as the intersection normal direction as 2 bytes (xy components of the normal vector) */
+layout (binding = 9) buffer coherent voxelVisibilityDynamic4ByteBuffer
+{
+    uint voxelVisibilityDynamic4Byte[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the per voxel face directions (128) to rebuilf the position of the ray intersected */
+layout (binding = 10) buffer coherent rayDirectionBuffer
+{
+    vec4 rayDirection[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** buffer with the per triagle triangulated indices information used in the light bounce step to gather 
+* extra samples of lit voxels for surfaces almost planar in voxel coordinates */
+layout (binding = 11) buffer coherent triangulatedIndicesBuffer
+{
+    uint triangulatedIndices[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer where for each voxel the visibility of static voxels is cached. The information
+*  stored in each 32-bit uint is the distance from the voxel to the visible voxel (if any)
+* in 16 bits and the hit normal in the other 16 bits encoded as 7 bits for x and y components 
+* and 1 bit for the z component's sign */
+layout (binding = 12) buffer coherent voxelVisibility4BytesBuffer
+{
+    uint voxelVisibility4Bytes[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the information about what neighbour voxels are lit and the voxel itself
+* Encodes whether there is an occupied static and lit voxel neighbour of the one being analysed
+* at bit level, with information on each neighbour at bit index:
+* Index 0:  offset (-1, -1, -1)
+* Index 1:  offset (-1, -1,  0)
+* Index 2:  offset (-1, -1,  1)
+* Index 3:  offset (-1,  0, -1)
+* Index 4:  offset (-1,  0,  0)
+* Index 5:  offset (-1,  0,  1)
+* Index 6:  offset (-1,  1, -1)
+* Index 7:  offset (-1,  1,  0)
+* Index 8:  offset (-1,  1,  1)
+* Index 9:  offset ( 0, -1, -1)
+* Index 10: offset ( 0, -1,  0)
+* Index 11: offset ( 0, -1,  1)
+* Index 12: offset ( 0,  0, -1)
+* Index 13: offset ( 0,  0,  0)
+* Index 14: offset ( 0,  0,  1)
+* Index 15: offset ( 0,  1, -1)
+* Index 16: offset ( 0,  1,  0)
+* Index 17: offset ( 0,  1,  1)
+* Index 18: offset ( 1, -1, -1)
+* Index 19: offset ( 1, -1,  0)
+* Index 20: offset ( 1, -1,  1)
+* Index 21: offset ( 1,  0, -1)
+* Index 22: offset ( 1,  0,  0)
+* Index 23: offset ( 1,  0,  1)
+* Index 24: offset ( 1,  1, -1)
+* Index 25: offset ( 1,  1,  0)
+* Index 26: offset ( 1,  1,  1) */
+layout (binding = 13) buffer coherent neighbourLitVoxelInformationBuffer
+{
+    uint neighbourLitVoxelInformation[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout(binding = 14) uniform usampler3D staticVoxelIndexTexture;
+
+// Samplers
+// TODO: USE AS TEXTURES BEING SAMPLED FOR voxelizationReflectance AND dynamicVoxelizationReflectanceTexture
+layout(binding = 15, r32ui) uniform coherent volatile uimage3D voxelizationReflectance;
+layout(binding = 16, r32ui) uniform coherent volatile uimage3D dynamicVoxelizationReflectanceTexture;
+layout(binding = 17, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DStaticNegativeX;
+layout(binding = 18, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DStaticPositiveX;
+layout(binding = 19, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DStaticNegativeY;
+layout(binding = 20, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DStaticPositiveY;
+layout(binding = 21, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DStaticNegativeZ;
+layout(binding = 22, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DStaticPositiveZ;
+
+layout(binding = 23) uniform accelerationStructureEXT raytracedaccelerationstructure; // TODO: Remove and use the ray visibility information
+
+/** Texture with infomation at bit level on whehter neighbouring voxels are occupied by static voxels or not
+* The neighbour voxel occupied information in encoded on a 32-bit unsigned int variable with bit index detailed below:
+* bit 0:  Information for neighbour voxel at offset (-1, -1, -1)
+* bit 1:  Information for neighbour voxel at offset (-1, -1,  0)
+* bit 2:  Information for neighbour voxel at offset (-1, -1,  1)
+* bit 3:  Information for neighbour voxel at offset (-1,  0, -1)
+* bit 4:  Information for neighbour voxel at offset (-1,  0,  0)
+* bit 5:  Information for neighbour voxel at offset (-1,  0,  1)
+* bit 6:  Information for neighbour voxel at offset (-1,  1, -1)
+* bit 7:  Information for neighbour voxel at offset (-1,  1,  0)
+* bit 8:  Information for neighbour voxel at offset (-1,  1,  1)
+* bit 9:  Information for neighbour voxel at offset ( 0, -1, -1)
+* bit 10: Information for neighbour voxel at offset ( 0, -1,  0)
+* bit 11: Information for neighbour voxel at offset ( 0, -1,  1)
+* bit 12: Information for neighbour voxel at offset ( 0,  0, -1)
+* bit 13: Information for neighbour voxel at offset ( 0,  0,  0)
+* bit 14: Information for neighbour voxel at offset ( 0,  0,  1)
+* bit 15: Information for neighbour voxel at offset ( 0,  1, -1)
+* bit 16: Information for neighbour voxel at offset ( 0,  1,  0)
+* bit 17: Information for neighbour voxel at offset ( 0,  1,  1)
+* bit 18: Information for neighbour voxel at offset ( 1, -1, -1)
+* bit 19: Information for neighbour voxel at offset ( 1, -1,  0)
+* bit 20: Information for neighbour voxel at offset ( 1, -1,  1)
+* bit 21: Information for neighbour voxel at offset ( 1,  0, -1)
+* bit 22: Information for neighbour voxel at offset ( 1,  0,  0)
+* bit 23: Information for neighbour voxel at offset ( 1,  0,  1)
+* bit 24: Information for neighbour voxel at offset ( 1,  1, -1)
+* bit 25: Information for neighbour voxel at offset ( 1,  1,  0)
+* bit 26: Information for neighbour voxel at offset ( 1,  1,  1) */
+layout(binding = 24) uniform usampler3D staticVoxelNeighbourInfo;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used as an atomic counter for debug purposes */
+layout (binding = 25) buffer coherent debugCounterBuffer
+{
+	uint debugCounter;
+} myDebugCounterBuffer;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used to track static voxel irradiance generated in the last frame and that needs to be tracked to avoid leaving static voxels with permanent
+* irradiance from moving objects, following a cool down / fading time, which neaches 0 is used to reset the irradiance value */
+layout (binding = 26) buffer coherent staticIrradianceTrackingBuffer
+{
+    uint8_t staticIrradianceTracking[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// DEFINES
+#define PI                                    3.14159265359
+#define NUMBER_DIRECTION                      6
+#define NUM_VOXEL_FACE_FLOAT                  6.0
+#define NUMBER_DESIRED_POINT                128
+#define NUMBER_THREAD_PER_LOCAL_WORKGROUP   128
+#define MIN_IRRADIANCE_VALUE                  0.01
+#define NUMBER_ELEMENT_MAP_DIRECTIONS         4 // Number of 32-bit uint variables used for each voxel face to map visibile voxels for dynamic rays in dynamicVoxelVisibilityFlagBuffer
+#define NUMBER_VOXEL_3X3                     27 // Number of voxels in a set of 3^3 set
+#define NUMBER_AXIS                           3
+#define NUMBER_VOXEL_POSSIBLE_NEIGHBOUR       4
+#define NUMBER_VOXEL_FULL_NEIGHBOUR          14
+#define NUMBER_PLANAR_VECTOR                  2
+#define NUMBER_VOXEL_FACE_VOXEL               9
+#define NUMBER_IMMEDIATE_NEIGHBOURS           1
+#define UINT_MAX_VALUE               4294967295
+
+#define ADD_irradianceFromAnyLitCloseNeighbourStatic_INFO 1
+#define ADD_voxelToVoxelIrradianceBasic_INFO 1
+#define ADD_minimal_voxel_sampling_debug_info 1
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+float g_voxelSize;               //!< Size of the voxelization texture
+int   g_voxelSizeInt;            //!< Size of the voxelization texture
+vec3  g_sceneExtent;             //!< Scene extent
+vec3  g_sceneMin;                //!< Scene AABB min value
+vec3  g_voxelWorldCoordinates;   //!< Analyzed voxel world coordinates
+ivec3 g_voxelTextureCoordinates; //!< Analyzed voxel texture coordinates
+uint  g_axisIndex;               //!< Voxel face index, with {0,1,2,3,4,5} meaning {-x, +x, -y, +y, -z, +z}
+vec3  g_voxelWorldHalfDiagonal;  //!< World size of a voxel half diagonal
+vec3  g_rayOrigin;               //!< Ray origin used for the corresponding direction being analysed
+
+bool record;
+uint counter;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// SHARED VARIABLES
+shared f16vec4 g_irradiance[NUMBER_THREAD_PER_LOCAL_WORKGROUP];
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** One of the precomputed directions to compare with the normal direction of the fragment, to ray
+* march on voxel space in the search of lit voxels
+* Three 15 elements per dirfection */
+i8vec3 arrayVoxelRayDirection[NUMBER_DIRECTION] =
+{
+	i8vec3(uint8_t(-1), uint8_t( 0), uint8_t( 0)), // Negative x
+	i8vec3(uint8_t( 1), uint8_t( 0), uint8_t( 0)), // Positive x
+	i8vec3(uint8_t( 0), uint8_t(-1), uint8_t( 0)), // Negative y
+	i8vec3(uint8_t( 0), uint8_t( 1), uint8_t( 0)), // Positive y
+	i8vec3(uint8_t( 0), uint8_t( 0), uint8_t(-1)), // Negative z
+	i8vec3(uint8_t( 0), uint8_t( 0), uint8_t( 1))  // Positive z
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Offsets of the neighbour voxels analysed in each element in neighbourLitVoxelInformationBuffer */
+i8vec3 arrayNeighoburLitOffset[NUMBER_VOXEL_3X3] = 
+{
+	i8vec3(uint8_t(-1), uint8_t(-1), uint8_t(-1)),
+	i8vec3(uint8_t(-1), uint8_t(-1), uint8_t( 0)),
+	i8vec3(uint8_t(-1), uint8_t(-1), uint8_t( 1)),
+	i8vec3(uint8_t(-1), uint8_t( 0), uint8_t(-1)),
+	i8vec3(uint8_t(-1), uint8_t( 0), uint8_t( 0)),
+	i8vec3(uint8_t(-1), uint8_t( 0), uint8_t( 1)),
+	i8vec3(uint8_t(-1), uint8_t( 1), uint8_t(-1)),
+	i8vec3(uint8_t(-1), uint8_t( 1), uint8_t( 0)),
+	i8vec3(uint8_t(-1), uint8_t( 1), uint8_t( 1)),
+	i8vec3(uint8_t( 0), uint8_t(-1), uint8_t(-1)),
+	i8vec3(uint8_t( 0), uint8_t(-1), uint8_t( 0)),
+	i8vec3(uint8_t( 0), uint8_t(-1), uint8_t( 1)),
+	i8vec3(uint8_t( 0), uint8_t( 0), uint8_t(-1)),
+	i8vec3(uint8_t( 0), uint8_t( 0), uint8_t( 0)),
+	i8vec3(uint8_t( 0), uint8_t( 0), uint8_t( 1)),
+	i8vec3(uint8_t( 0), uint8_t( 1), uint8_t(-1)),
+	i8vec3(uint8_t( 0), uint8_t( 1), uint8_t( 0)),
+	i8vec3(uint8_t( 0), uint8_t( 1), uint8_t( 1)),
+	i8vec3(uint8_t( 1), uint8_t(-1), uint8_t(-1)),
+	i8vec3(uint8_t( 1), uint8_t(-1), uint8_t( 0)),
+	i8vec3(uint8_t( 1), uint8_t(-1), uint8_t( 1)),
+	i8vec3(uint8_t( 1), uint8_t( 0), uint8_t(-1)),
+	i8vec3(uint8_t( 1), uint8_t( 0), uint8_t( 0)),
+	i8vec3(uint8_t( 1), uint8_t( 0), uint8_t( 1)),
+	i8vec3(uint8_t( 1), uint8_t( 1), uint8_t(-1)),
+	i8vec3(uint8_t( 1), uint8_t( 1), uint8_t( 0)),
+	i8vec3(uint8_t( 1), uint8_t( 1), uint8_t( 1)),
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array of offsets in arrayNeighoburLitOffset depending on the axis used for analysis
+* for the ANALYSE_POSSIBLE_NEIGHBOUR_LIT_VOXEL case */
+uint8_t arrayNeighoburLitOffsetMapping[NUMBER_AXIS][NUMBER_VOXEL_POSSIBLE_NEIGHBOUR] = 
+{
+	{ uint8_t(10), uint8_t(16), uint8_t(12), uint8_t(14) }, // x axis
+	{  uint8_t(4), uint8_t(22), uint8_t(12), uint8_t(14) }, // y axis
+	{  uint8_t(4), uint8_t(22), uint8_t(10), uint8_t(16) }, // z axis
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array of offsets in arrayNeighoburLitOffset depending on the axis used for analysis
+* for the USE_FULL_NEIGHBOUR_SAMPLING case */
+uint8_t arrayNeighoburLitOffsetMappingFull[NUMBER_AXIS][NUMBER_VOXEL_FULL_NEIGHBOUR] = 
+{
+	{ uint8_t(9), uint8_t(11), uint8_t(15), uint8_t(17), uint8_t(18), uint8_t(20), uint8_t(24), uint8_t(26), uint8_t(0), uint8_t(2),  uint8_t(6),  uint8_t(8),  uint8_t(4), uint8_t(22) }, // x axis
+	{ uint8_t(3),  uint8_t(5), uint8_t(21), uint8_t(23),  uint8_t(6),  uint8_t(8), uint8_t(24), uint8_t(26), uint8_t(0), uint8_t(2), uint8_t(18), uint8_t(20), uint8_t(10), uint8_t(16) }, // y axis
+	{ uint8_t(1),  uint8_t(7), uint8_t(19), uint8_t(25),  uint8_t(2),  uint8_t(8), uint8_t(20), uint8_t(26), uint8_t(0), uint8_t(6), uint8_t(18), uint8_t(24), uint8_t(12), uint8_t(14) }, // z axis
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array for offset coordinates when trying to get irradiance from immediate lit neighbours in the voxel face direction being analysed */
+ivec3 arrayAxisPlanarVector[NUMBER_AXIS][NUMBER_IMMEDIATE_NEIGHBOURS] = 
+{
+	{ivec3( 0,  0,  0)}, // x axis, plane yz
+	{ivec3( 0,  0,  0)}, // y axis, plane xz
+	{ivec3( 0,  0,  0)}, // z axis, plane xy
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array with the bit indices in elements of staticVoxelNeighbourInfo to test, for a specific voxel face, 
+* whether all the neighbour voxels in that voxel face direction are occupied */
+uint8_t occupiedNeighbourIndices[NUMBER_AXIS][NUMBER_VOXEL_FACE_VOXEL] = 
+{
+	{ uint8_t(9), uint8_t(10), uint8_t(11), uint8_t(12), uint8_t(13), uint8_t(14), uint8_t(15), uint8_t(16), uint8_t(17)}, // Negative and positive x voxel face
+	{ uint8_t(3),  uint8_t(4),  uint8_t(5), uint8_t(12), uint8_t(13), uint8_t(14), uint8_t(21), uint8_t(22), uint8_t(23)}, // Negative and positive y voxel face
+	{ uint8_t(1),  uint8_t(4),  uint8_t(7), uint8_t(10), uint8_t(13), uint8_t(16), uint8_t(19), uint8_t(22), uint8_t(25)}, // Negative and positive z voxel face
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Integer version o fthe dot product of two 3 component vectors
+* @param a [in] one of the two vectors
+* @param b [in] one of the two vectors
+* @return rsult of the dot product between both vectors */
+int integerDot(ivec3 a, ivec3 b)
+{
+	return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** hashed value for texture coordinates given as parameter in a voxelization of size given as parameter
+* @param texcoord  [in] texture coordinates
+* @param voxelSize [in] voxelization size
+* @return hashed value */
+int getHashedIndex(ivec3 texcoord)
+{
+	return texcoord.x * g_voxelSizeInt * g_voxelSizeInt + texcoord.y * g_voxelSizeInt + texcoord.z;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupied if the current voxel is occupied by at least one fragment, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupied(uint indexHashed)
+{    
+	float integerPart;
+	float indexDecimalFloat = float(indexHashed) / 32.0;
+	float fractional        = modf(indexDecimalFloat, integerPart);
+	uint index              = uint(integerPart);
+	uint bit                = uint(fractional * 32.0);
+	bool result             = ((voxelOccupied[index] & (1 << bit)) > 0);
+	return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupiedDynamic if the current voxel is occupied by one voxel, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupiedDynamic(uint indexHashed)
+{
+	float integerPart;
+	float indexDecimalFloat = float(indexHashed) / 32.0;
+	float fractional        = modf(indexDecimalFloat, integerPart);
+	uint index              = uint(integerPart);
+	uint bit                = uint(fractional * 32.0);
+	bool result             = ((voxelOccupiedDynamic[index] & (1 << bit)) > 0);
+	return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+ivec3 unhashValue(uint value)
+{
+	float number     = float(value) / g_voxelSize;
+
+	ivec3 result;
+	float integerPart;
+	float fractional = modf(number, integerPart);
+	result.z         = int(fractional * g_voxelSize);
+	number          /= g_voxelSize;
+	fractional       = modf(number, integerPart);
+	result.y         = int(fractional * g_voxelSize);
+	result.x         = int(integerPart);
+
+	return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes texture space coordinates of the world coordinates given as parameter
+* @param worldCoordinates [in] world coordinates
+* @return texture space coordinates of the world coordinates given as parameter */
+ivec3 worldToVoxelSpaceInteger(vec3 worldCoordinates)
+{
+	vec3 result = worldCoordinates;
+	result     -= g_sceneMin;
+	result     /= g_sceneExtent;
+	result     *= vec3(g_voxelSize);
+
+	return ivec3(int(result.x), int(result.y), int(result.z));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes world space coordinates for 3D texture coordinates
+* @param coordinates [in] texture coordinates
+* @return world coordinates of the voxel coordinates given as parameter */
+vec3 voxelSpaceToWorld(ivec3 coordinates)
+{
+	vec3 result = vec3(float(coordinates.x), float(coordinates.y), float(coordinates.z));
+	result     /= vec3(g_voxelSize);
+	result     *= g_sceneExtent;
+	result     += g_sceneMin;
+	result     += (g_sceneExtent / g_voxelSize) * 0.5;
+	return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Search in voxelHashedPositionCompactedBuffer for the index of the hashed value
+* of the texcoord parameter.
+* @param texcoord [in] 3D texture coordinates to find index for
+* @return uvec2 with index in .x field and test result in .y field */
+uvec2 findHashedCompactedPositionIndex(uvec3 texcoord)
+{
+	uint index = texelFetch(staticVoxelIndexTexture, ivec3(texcoord), 0).r;
+
+	if(index != UINT_MAX_VALUE)
+	{
+		return uvec2(index, 1);
+	}
+
+	return uvec2(0, 0);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Test whether the voxel at index indexHashed has any face set as lit
+* @param indexHashed [in] voxel index to test if it has any voxel face as lit
+* @return true if any voxel face as been set as lit, false otherwise */
+bool isVoxelLit(uint indexHashed)
+{
+	return (litTestVoxelPerByte[indexHashed] > 0);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns the form factor from a differential area with normal normalDA and to a
+* differential area with position positionDB and normal normalDB
+* NOTE: taken from J. R. Wallace, K. A. Elmquist, and E. A. Haines. 1989. A Ray tracing algorithm for progressive radiosity
+* @param normalDA             [in] Normal of the differential area A
+* @param positionDA           [in] Point position of the differential area A
+* @param normalDB             [in] Normal of the differential area B
+* @param positionDB           [in] Point position of the differential area B
+* @param isDynamic            [in] flag to know if the computation being done has a dynamic voxel involved
+* @param isImmediateNeighbour [in] flag to know if the differential area computation has an immediate neighbour voxel involved
+* @return form factor value */
+float differentialAreaFormFactor(vec3 normalDA, vec3 positionDA, vec3 normalDB, vec3 positionDB, bool isDynamic, bool isImmediateNeighbour)
+{
+	vec3 dAtoDiskDirection = positionDB - positionDA;
+	float distanceSq       = dot(dAtoDiskDirection, dAtoDiskDirection);
+	dAtoDiskDirection      = normalize(dAtoDiskDirection);
+	float cosTheta1        = dot(normalDA, dAtoDiskDirection);
+	cosTheta1              = clamp(cosTheta1, 0.0, 1.0);
+	float cosTheta2        = dot(normalDB, -1.0 * dAtoDiskDirection);
+	cosTheta2              = clamp(cosTheta2, 0.0, 1.0);
+
+	// To avoid close points reach too high values due to the form factor formula
+	if(isImmediateNeighbour || isDynamic)
+	{
+		distanceSq = max(distanceSq, 0.05);
+	}
+	else
+	{
+		distanceSq = max(distanceSq, float(MIN_SQUARED_DISTANCE_FORM_FACTOR_STATIC) / 10.0);
+	}
+	
+	float nSamples = 0.0;
+
+#ifdef ADD_EXTRA_VALUE_FORM_FACTOR
+	float distanceAttenuationStart = 15.0;
+	float distanceBetweenPoints    = distance(positionDA, positionDB);
+	distanceBetweenPoints = clamp(distanceBetweenPoints, 0.0, distanceAttenuationStart);
+
+	if(!isDynamic)
+	{
+		nSamples = 100.0 * (1.0 - (distanceBetweenPoints / distanceAttenuationStart)) * (1.0 - (distanceBetweenPoints / distanceAttenuationStart));
+	}
+#endif // ADD_EXTRA_VALUE_FORM_FACTOR
+
+	return (cosTheta1 * cosTheta2) / (PI * distanceSq + nSamples);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+vec4 convRGBA8ToVec4New(uint val)
+{
+	return vec4(float((val&0x000000FF)), float((val&0x0000FF00)>>8U), float ((val&0x00FF0000)>>16U), float((val&0xFF000000)>>24U));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Test whether the voxel next to the one given by the test coordinates in the direction test -> destination is occupied
+* @param origin      [in] voxel to test
+* @param destination [in] voxel destination coordinates
+* @return true is occupied, false otherwise */
+bool isVoxelNeighBourOccupied(ivec3 test, ivec3 destination)
+{
+	ivec3 offsetDirection = destination - test;
+
+	// Return true for cases where test and destination parameters only differ in 1 unit
+	if(max(abs(offsetDirection.x), max(abs(offsetDirection.y), abs(offsetDirection.z))) <= 1)
+	{
+		return false;
+	}
+
+	vec3 directionFloat = vec3(offsetDirection);
+	directionFloat      = normalize(directionFloat);
+	offsetDirection     = ivec3(round(directionFloat.x), round(directionFloat.y), round(directionFloat.z));
+
+	uint testValue            = getHashedIndex(test + offsetDirection);
+	bool voxelOccupied        = isVoxelOccupied(testValue);
+	bool voxelOccupiedDynamic = isVoxelOccupiedDynamic(testValue);
+
+	return voxelOccupied || voxelOccupiedDynamic;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+vec3 offsetVoxelCoordinates(vec3 sufraceHitNormal, vec3 voxelCenter)
+{
+    vec3 projectedSurfaceHitNormal;
+
+    switch (g_axisIndex)
+    {
+        case 0: case 1:
+        {
+            projectedSurfaceHitNormal = vec3(0.0, sufraceHitNormal.y, sufraceHitNormal.z); // YZ plane projection
+            break;
+        }
+        case 2: case 3:
+        {
+            projectedSurfaceHitNormal = vec3(sufraceHitNormal.x, 0.0, sufraceHitNormal.z); // XZ plane projection
+            break;
+        }
+        case 4: case 5:
+        {
+            projectedSurfaceHitNormal = vec3(sufraceHitNormal.x, sufraceHitNormal.y, 0.0); // XY plane projection
+            break;
+        }
+    }
+
+    if (length(projectedSurfaceHitNormal) == 0.0)
+    {
+        return voxelCenter;
+    }
+
+    projectedSurfaceHitNormal = normalize(projectedSurfaceHitNormal);
+
+    return voxelCenter + projectedSurfaceHitNormal * g_voxelWorldHalfDiagonal;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Compute the reflected irradiance from a directional emitter with direction lightDirection (from the surface being analysed)
+* for a lambertian surface with normal direction surfaceNormal
+* https://bheisler.github.io/post/writing-raytracer-in-rust-part-2/
+* https://www.scratchapixel.com/lessons/3d-basic-rendering/introduction-to-shading/diffuse-lambertian-shading.html
+* @param lightDirection  [in] direction towards the light
+* @param surfaceNormal   [in] normal direction of the surface being analysed
+* @param emitterRadiance [in] emitter radiance
+* @return form factor value */
+float reflectedIrradianceDirectionalLight(vec3 lightDirection, vec3 surfaceNormal, float emitterRadiance)
+{
+    float reflectedIrradiance = dot(lightDirection, surfaceNormal);
+    reflectedIrradiance      *= emitterRadiance;
+    reflectedIrradiance      /= PI;
+    
+    return reflectedIrradiance;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Compute irradiance from a voxel with coordinates tempCoordinates0, normal surfaceNormal
+* towards the voxel g_voxelTextureCoordinates being analysed
+* @param hitWorldCoordinates   [in] world coordinates of the hit point
+* @param hitTextureCoordinates [in] voxel coordinates of the hit point
+* @param surfaceNormal         [in] normal direction for the surface associated to the voxel
+* @param directlyVisible       [in] for those case where the visibility is known, avoid the "isVoxelNeighBourOccupied" test
+* @param isDynamicVoxel        [in] in case the irradiance is from a dynamic voxel
+* @param isImmediateNeighbour  [in] flag to know if the differential area computation has an immediate neighbour voxel involved
+* @return irradiance between point at worldCoordinates with normal surfaceNormal and  */
+vec4 voxelToVoxelIrradianceBasic(vec3 hitWorldCoordinates, ivec3 hitTextureCoordinates, vec3 surfaceNormal, bool directlyVisible, bool isDynamicVoxel, bool isImmediateNeighbour)
+{
+	if(!directlyVisible && isVoxelNeighBourOccupied(hitTextureCoordinates, g_voxelTextureCoordinates))
+	{
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+
+	vec3 emitterNormal                     = myMaterialData.lightForwardEmitterRadiance.xyz;
+	vec3 emitterPosition                   = myMaterialData.lightPosition.xyz;
+	float emitterRadiance                  = myMaterialData.lightForwardEmitterRadiance.w;
+
+	// Offset the voxel position from where the irradiance is being computed
+	vec3 voxelWorldCoordinatesOffset       = offsetVoxelCoordinates(surfaceNormal.xyz, g_voxelWorldCoordinates);
+
+	// Offset the surface hit in theopposite direction of the surface normal (currently, the two voxel positions in worl coordinates would be taken into consideration)
+	vec3 voxelRayHitWorldCoordinatesOffset = offsetVoxelCoordinates(-1.0 * surfaceNormal.xyz, hitWorldCoordinates);
+
+	vec3 g_voxelNormal                     = vec3(arrayVoxelRayDirection[g_axisIndex]);
+
+	float reflectedIrradiance              = reflectedIrradianceDirectionalLight(normalize(emitterPosition), surfaceNormal, emitterRadiance);
+	float formFactorVoxel0                 = differentialAreaFormFactor(g_voxelNormal, voxelWorldCoordinatesOffset, surfaceNormal.xyz, voxelRayHitWorldCoordinatesOffset, isDynamicVoxel, isImmediateNeighbour);
+
+	float cosAngleSurfaceNormalEmitterDirection = dot(surfaceNormal, normalize(emitterPosition - hitWorldCoordinates));
+
+	if(cosAngleSurfaceNormalEmitterDirection < -0.1)
+	{
+		return vec4(0.0, 0.0, 0.0, 1.0);
+	}
+
+	vec3 voxelReflectance;
+	uint voxelReflectanceUint;
+	if(isDynamicVoxel)
+	{
+		voxelReflectanceUint = imageLoad(dynamicVoxelizationReflectanceTexture, hitTextureCoordinates).r;
+    	voxelReflectance     = convRGBA8ToVec4New(voxelReflectanceUint).xyz;
+	}
+	else
+	{
+		voxelReflectanceUint = imageLoad(voxelizationReflectance, hitTextureCoordinates).r;
+    	voxelReflectance     = convRGBA8ToVec4New(voxelReflectanceUint).xyz;
+	}
+
+	// In some cases, the normal direction from the hit point from the voxel face ,surfaceNormal, is nor representative of the majority of the gometry being intersected, with normal
+	// directions that vary a lot from one voxel to another. Takking the maximum value of the forma factor betwen the normal direction data and a computed surface normal midway between
+	// the directions from the sample to the emitter and from the sample to the voxel whose irradiance per face is being computed is a try to minimize that variation of sampled surface normals.
+	vec3 currentIrradiance          = reflectedIrradiance * formFactorVoxel0 * emitterRadiance * voxelReflectance;
+	float irradianceVectorLength    = length(currentIrradiance);
+	float maxIrradiancevectorLength = isDynamicVoxel ? float(MAX_IRRADIANCE_DYNAMIC_TO_STATIC_VECTOR_LENGTH) / 100.0 : isImmediateNeighbour ? 1000000.0 : float(MAX_IRRADIANCE_STATIC_TO_STATIC_VECTOR_LENGTH) / 100.0;
+	
+	if(irradianceVectorLength > maxIrradiancevectorLength)
+	{
+		currentIrradiance /= irradianceVectorLength;
+		currentIrradiance *= maxIrradiancevectorLength;
+	}
+
+	if(dot(currentIrradiance.xyz, vec3(1.0)) > MIN_IRRADIANCE_VALUE)
+    {
+
+    	return vec4(currentIrradiance.xyz, 1.0);
+    }
+
+	return vec4(0.0, 0.0, 0.0, 1.0);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+bool doRecord = false;
+uint recordCounter = 0;
+
+uint8_t neighbourInfoIndices[4];
+uint8_t neighbourInfoIndicesFull[14];
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Given a normalized direction by the direction parameter, return the index in
+* arrayVoxelRayDirection of the closest direction
+* @param direction [in] direction to test
+* @return index in arrayVoxelRayDirection of the closest direction */
+int getClosestDirectionIndex(vec3 direction)
+{
+    int indexClosest   = -1;
+    float minimumAngle = -1.0;
+    float minimumAngleTemp;
+
+    for(int i = 0; i < NUMBER_DIRECTION; ++i)
+    {
+        minimumAngleTemp = dot(vec3(arrayVoxelRayDirection[i]), direction);
+
+        if(minimumAngleTemp > minimumAngle)
+        {
+            minimumAngle = minimumAngleTemp;
+            indexClosest = i;
+        }
+    }
+
+    return indexClosest;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Given a normalized direction by the direction parameter, compute the bit indices to test for
+* lit and occupied neighbouring voxels from neighbourLitVoxelInformationBuffer for a specific voxel
+* The function will fill four bit indices in the neighbourInfoIndices array in case
+* ANALYSE_POSSIBLE_NEIGHBOUR_LIT_VOXEL is defined, and another 14  in the array neighbourInfoIndicesFull 
+* in case USE_FULL_NEIGHBOUR_SAMPLING is defined.
+* @param direction [in] normal direction to test
+* @return index with the axis found, 0 for x axis, 1 for y axis, 2 for z axis */
+int fillBitIndicesFromNormalDirection(vec3 direction)
+{
+#ifdef ANALYSE_POSSIBLE_NEIGHBOUR_LIT_VOXEL
+	int indexClosest  = getClosestDirectionIndex(direction);
+	int indexToReturn = -1;
+
+	switch(indexClosest)
+	{
+		case 0:
+		case 1:
+		{
+			neighbourInfoIndices[0] = uint8_t(10);
+			neighbourInfoIndices[1] = uint8_t(16);
+			neighbourInfoIndices[2] = uint8_t(12);
+			neighbourInfoIndices[3] = uint8_t(14);
+			indexToReturn           = 0;
+			break;
+		}
+		case 2:
+		case 3:
+		{
+			neighbourInfoIndices[0] = uint8_t(4);
+			neighbourInfoIndices[1] = uint8_t(22);
+			neighbourInfoIndices[2] = uint8_t(12);
+			neighbourInfoIndices[3] = uint8_t(14);
+			indexToReturn           = 1;
+			break;
+		}
+		case 4:
+		case 5:
+		{
+			neighbourInfoIndices[0] = uint8_t(4);
+			neighbourInfoIndices[1] = uint8_t(22);
+			neighbourInfoIndices[2] = uint8_t(10);
+			neighbourInfoIndices[3] = uint8_t(16);
+			indexToReturn           = 2;
+			break;
+		}
+	}
+
+#ifdef USE_FULL_NEIGHBOUR_SAMPLING
+	switch(indexClosest)
+	{
+		case 0:
+		case 1:
+		{
+			neighbourInfoIndicesFull[0]  = uint8_t(9);
+			neighbourInfoIndicesFull[1]  = uint8_t(11);
+			neighbourInfoIndicesFull[2]  = uint8_t(15);
+			neighbourInfoIndicesFull[3]  = uint8_t(17);
+			neighbourInfoIndicesFull[4]  = uint8_t(18);
+			neighbourInfoIndicesFull[5]  = uint8_t(20);
+			neighbourInfoIndicesFull[6]  = uint8_t(24);
+			neighbourInfoIndicesFull[7]  = uint8_t(26);
+			neighbourInfoIndicesFull[8]  = uint8_t(0);
+			neighbourInfoIndicesFull[9]  = uint8_t(2);
+			neighbourInfoIndicesFull[10] = uint8_t(6);
+			neighbourInfoIndicesFull[11] = uint8_t(8);
+			neighbourInfoIndicesFull[12] = uint8_t(4);
+			neighbourInfoIndicesFull[13] = uint8_t(22);
+			break;
+		}
+		case 2:
+		case 3:
+		{
+			neighbourInfoIndicesFull[0]  = uint8_t(3);
+			neighbourInfoIndicesFull[1]  = uint8_t(5);
+			neighbourInfoIndicesFull[2]  = uint8_t(21);
+			neighbourInfoIndicesFull[3]  = uint8_t(23);
+			neighbourInfoIndicesFull[4]  = uint8_t(6);
+			neighbourInfoIndicesFull[5]  = uint8_t(8);
+			neighbourInfoIndicesFull[6]  = uint8_t(24);
+			neighbourInfoIndicesFull[7]  = uint8_t(26);
+			neighbourInfoIndicesFull[8]  = uint8_t(0);
+			neighbourInfoIndicesFull[9]  = uint8_t(2);
+			neighbourInfoIndicesFull[10] = uint8_t(18);
+			neighbourInfoIndicesFull[11] = uint8_t(20);
+			neighbourInfoIndicesFull[12] = uint8_t(10);
+			neighbourInfoIndicesFull[13] = uint8_t(16);
+			break;
+		}
+		case 4:
+		case 5:
+		{
+			neighbourInfoIndicesFull[0]  = uint8_t(1);
+			neighbourInfoIndicesFull[1]  = uint8_t(7);
+			neighbourInfoIndicesFull[2]  = uint8_t(19);
+			neighbourInfoIndicesFull[3]  = uint8_t(25);
+			neighbourInfoIndicesFull[4]  = uint8_t(2);
+			neighbourInfoIndicesFull[5]  = uint8_t(8);
+			neighbourInfoIndicesFull[6]  = uint8_t(20);
+			neighbourInfoIndicesFull[7]  = uint8_t(26);
+			neighbourInfoIndicesFull[8]  = uint8_t(0);
+			neighbourInfoIndicesFull[9]  = uint8_t(6);
+			neighbourInfoIndicesFull[10] = uint8_t(18);
+			neighbourInfoIndicesFull[11] = uint8_t(24);
+			neighbourInfoIndicesFull[12] = uint8_t(12);
+			neighbourInfoIndicesFull[13] = uint8_t(14);
+			break;
+		}
+	}
+
+#endif // USE_FULL_NEIGHBOUR_SAMPLING
+
+#endif // ANALYSE_POSSIBLE_NEIGHBOUR_LIT_VOXEL
+
+	return indexToReturn;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+vec4 irradianceFromAnyLitCloseNeighbourStatic(ivec3 coordinates, vec3 normalDirection, float minDistance)
+{
+#ifdef ANALYSE_POSSIBLE_NEIGHBOUR_LIT_VOXEL
+
+	int indexAxis                = fillBitIndicesFromNormalDirection(normalDirection);
+
+	// The call to this function is within an "if(isVoxelOccupied(hashedIndex0))" for the coordinates parameter
+	// so there is a voxel present at those coordinates
+	uvec2 resultFind             = findHashedCompactedPositionIndex(uvec3(coordinates));
+	uint neighbourLitInformation = neighbourLitVoxelInformation[resultFind.x];
+	float minDistanceSq          = minDistance * minDistance;
+
+	ivec3 testCoordinates;
+	vec3 testCoordinatesWorld;
+	float distanceToTestedVoxelFaceSq;
+    bool neighbourIsOccupied;
+    uint voxelReflectanceUint0;
+    vec3 voxelReflectance0;
+    vec4 computedIrradiance;
+
+	for(int i = 0; i < 4; ++i)
+	{
+		// No need to test for offsets going outside voxelization boundaries as i has already been tested when doing the computations to analyse all 
+		// the occupied and lit voxels in the neighbourhood, being the bit 0 for those neighbours out of bounds
+		if((neighbourLitInformation & (1 << uint(neighbourInfoIndices[i]))) > 0)
+		{
+			testCoordinates             = coordinates + ivec3(arrayNeighoburLitOffset[int(arrayNeighoburLitOffsetMapping[indexAxis][i])]);
+			testCoordinatesWorld        = voxelSpaceToWorld(testCoordinates);
+			distanceToTestedVoxelFaceSq = dot(g_voxelWorldCoordinates - testCoordinatesWorld, g_voxelWorldCoordinates - testCoordinatesWorld);
+		    neighbourIsOccupied         = isVoxelNeighBourOccupied(testCoordinates, g_voxelTextureCoordinates);
+
+			if(!neighbourIsOccupied && (distanceToTestedVoxelFaceSq > minDistanceSq))
+			{
+		   		// Assume the normal direction of the neuighbouring voxel is the same as the original voxel
+		       	computedIrradiance    = voxelToVoxelIrradianceBasic(voxelSpaceToWorld(testCoordinates), testCoordinates, normalDirection, false, false, false);
+
+		       	return computedIrradiance;
+			}
+		}
+	}
+
+#ifdef USE_FULL_NEIGHBOUR_SAMPLING
+
+	for(int i = 0; i < 14; ++i)
+	{
+		// No need to test for offsets going outside voxelization boundaries as i has already been tested when doing the computations to analyse all 
+		// the occupied and lit voxels in the neighbourhood, being the bit 0 for those neighbours out of bounds
+		if((neighbourLitInformation & (1 << uint(neighbourInfoIndicesFull[i]))) > 0)
+		{
+			testCoordinates             = coordinates + ivec3(arrayNeighoburLitOffset[int(arrayNeighoburLitOffsetMappingFull[indexAxis][i])]);
+			testCoordinatesWorld        = voxelSpaceToWorld(testCoordinates);
+			distanceToTestedVoxelFaceSq = dot(g_voxelWorldCoordinates - testCoordinatesWorld, g_voxelWorldCoordinates - testCoordinatesWorld);
+		    neighbourIsOccupied         = isVoxelNeighBourOccupied(testCoordinates, g_voxelTextureCoordinates);
+
+			if(!neighbourIsOccupied && (distanceToTestedVoxelFaceSq > minDistanceSq))
+			{
+		   		// Assume the normal direction of the neuighbouring voxel is the same as the original voxel
+		       	computedIrradiance    = voxelToVoxelIrradianceBasic(voxelSpaceToWorld(testCoordinates), testCoordinates, normalDirection, false, false, false);
+
+		       	return computedIrradiance;
+			}
+		}
+	}
+
+#endif // USE_FULL_NEIGHBOUR_SAMPLING
+
+#endif // ANALYSE_POSSIBLE_NEIGHBOUR_LIT_VOXEL
+
+return vec4(0.0, 0.0, 0.0, 1.0);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+bool isVoxelIndexDynamic(int rayIndex, int faceIndex, int hashedCompactedPositionIndex)
+{
+	// Find out if the voxel ssen is from static or dynamic geometry:
+    float integerPart;
+    float fractionalPart             = modf(float(rayIndex) / 32.0, integerPart);
+    uint voxelVisibleFlagIndex       = (hashedCompactedPositionIndex * int(NUMBER_ELEMENT_MAP_DIRECTIONS) * 6) + faceIndex * int(NUMBER_ELEMENT_MAP_DIRECTIONS) + int(integerPart);
+    uint dynamicVoxelVisibleBitFlags = dynamicVoxelVisibilityFlag[voxelVisibleFlagIndex];
+    bool result                      = ((dynamicVoxelVisibleBitFlags & (1 << rayIndex)) > 0);
+
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Sets to 1 the bit index given by the index parameter in the value given by the value parameter
+* @param index [in] index to set the bit to 1
+* @param value [in] value where to put the bit to 1
+* @return value with the bit set */
+uint setBit(int index, uint value)
+{
+	return value | (1 << index);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns 1.0 if the bit at index given by the index parameter is set to 1 in the value by the value parameter and 0.0 otherwise
+* @param index [in] index of the bit to analyse in the value parameter
+* @param value [in] value where to analyse if the bit at a certain index has value 1
+* @return 1.0 if the bit is set, 0.0 otherwise */
+float isBitSet(int index, uint value)
+{
+	if((value & (1 << index)) > 0)
+	{
+		return 1.0;
+	}
+
+	return 0.0;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Does the integer modulo operation x mod(y) returning the interger result
+* @param x [in] value to apply module to
+* @param y [in] value to apply module with
+* @return retul of the operation x mod(y) */
+float modulo(float x, float y)
+{
+    return x - (y * floor(x / y));
+}
+
+////////////////////////////////////////////////////////////////////////////////////
+
+/** Decode a normal with information in the first 16 bits of a 32-bit uint
+* with bits 0-6 for the x component, bit 7-13 for the y component, and bit 14 for the
+* z component sign (value 0 means negative, value 1, positive)
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ 
+* 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ 
+*    |s||   y component     ||   x component    |
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ 
+*/
+vec3 decodeNormalXYFloatToUInt7Bit(uint normal)
+{
+	uint xValue      =   0x0000007F & normal;
+	uint yValue      =  (0x00003F80 & normal) >> 7;
+	bool zPositive   = ((0x00004000 & normal) > 0);
+	vec3 resultFloat = vec3(float(xValue) / 127.0, float(yValue) / 127.0, 0.0);
+
+	resultFloat.x   -= 0.5;
+	resultFloat.x   *= 2.0;
+	resultFloat.y   -= 0.5;
+	resultFloat.y   *= 2.0;
+
+	resultFloat.x    = clamp(resultFloat.x, -1.0, 1.0);
+	resultFloat.y    = clamp(resultFloat.y, -1.0, 1.0);
+	float operand    = resultFloat.x * resultFloat.x + resultFloat.y * resultFloat.y;
+	operand          = clamp(operand, 0.0, 1.0);
+	resultFloat.z    = sqrt(1.0 - operand);
+
+	resultFloat.z   *= zPositive ? 1.0 : -1.0;
+
+	return normalize(resultFloat);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Decode from a 4 bytes uint the distance value (from the voxel center to the hit position) as a 16 bit 
+* float (in the bits 16-31) and a normal direction encoded using 7 bit integer approximation of the x and y 
+* normal direction components  in the bits 0-15 
+* @param hitInformation [in] hit information to decode
+* @return vec4 with normal direction in xyz fields and distance information in w field */
+vec4 decodeHitInformation(uint hitInformation)
+{
+	vec2 distanceInfo = unpackHalf2x16(hitInformation);
+	vec3 normalInfo   = decodeNormalXYFloatToUInt7Bit(hitInformation);
+    return vec4(normalInfo.x, normalInfo.y, normalInfo.z, distanceInfo.y);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Decode 8-bit per channel RGB value in val
+* @param val [in] value to decode
+* @return decoded 8-bit per channel RGB color value */
+ivec3 convertRGB8ToIvec3(uint val)
+{
+	return ivec3(val & 0x000000FF, (val & 0x0000FF00) >> 8U, (val & 0x00FF0000) >> 16U);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Shadow ray implementation between points start and end
+* @param start [in] start of the shadow ray
+* @param end   [in] end of the shadow ray
+* @return true of the emitter is visible, false otherwise */
+bool shadowRay(vec3 start, vec3 end)
+{
+	// TODO: Review performance impact
+	float tMin          = length(g_voxelWorldHalfDiagonal) * (DYNAMIC_VOXEL_RT_TMIN_MULTIPLIER / 100.0);
+	vec3 direction      = normalize(end);
+	float tMax          = length(end - start);
+
+	// The current approach for the emitter is a directional one, with the vector from the origin to his position being the light direction
+	vec3 lightDirection = normalize(myMaterialData.lightPosition.xyz);
+    if(dot(direction, lightDirection) <= 0.0)
+    {
+        return false;
+    }
+
+	bool rayNoIntersection = true;
+
+	rayQueryEXT rayQuery;
+	rayQueryInitializeEXT(rayQuery, raytracedaccelerationstructure, gl_RayFlagsTerminateOnFirstHitEXT, 0xFF, start, tMin, direction, tMax);
+
+	while(rayQueryProceedEXT(rayQuery))
+	{
+	}
+
+	if(rayQueryGetIntersectionTypeEXT(rayQuery, true) != gl_RayQueryCommittedIntersectionNoneEXT)
+	{
+		return false;
+	}
+
+	return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** In case a voxel is receiving irradiance and has close neighbour voxels lit, add irradiance from them
+* as the ray tracing visibility will not be able to reach too close / intravoxel cases like this
+* @param voxelFace            [in] voxel face being analysed
+* @param neighbourOffsetIndex [in] ofset index for a specific voxel face
+* @return irradiance added, if any, from a specific lit neighbour voxel */
+vec4 addIrradianceFromImmediateLitNeighbours(uint voxelFace, uint neighbourOffsetIndex)
+{
+	vec4 irradiance = vec4(0.0);
+
+	// Test if all the neighbouring voxels in the voxel face direction are occupied, avoiding light leaks
+	uint neighbourData = texelFetch(staticVoxelNeighbourInfo, g_voxelTextureCoordinates, 0).r;
+
+	for(uint i = 0; i < NUMBER_VOXEL_FACE_VOXEL; ++i)
+	{
+		if((neighbourData & (1 << uint(occupiedNeighbourIndices[voxelFace / 2][i]))) == 0)
+		{
+			return irradiance;
+		}
+	}
+
+	vec3 lightPosition   = myMaterialData.lightPosition.xyz;
+	bool shadowRayResult = shadowRay(g_rayOrigin, lightPosition);
+
+	if(!shadowRayResult)
+	{
+		return irradiance;
+	}
+
+	// If the immediate neighbour is not occupied, then test whether it is lit and in that case add irradiance from voxel center to voxel center
+	ivec3 offset                 = arrayAxisPlanarVector[voxelFace / 2][neighbourOffsetIndex] + ivec3(arrayVoxelRayDirection[voxelFace]);
+	ivec3 coordinatesToTest      = g_voxelTextureCoordinates + offset;
+	uint coordinatesToTestHashed = uint(getHashedIndex(coordinatesToTest));
+
+	if(isVoxelLit(coordinatesToTestHashed)) // Is voxel occupied condition already tested at the beginning of the function
+	{
+        vec3 voxelWorldCoordinates = voxelSpaceToWorld(coordinatesToTest);
+        vec3 voxelNormal           = normalize(lightPosition - voxelWorldCoordinates);
+		irradiance                += voxelToVoxelIrradianceBasic(voxelWorldCoordinates, coordinatesToTest, voxelNormal, true, false, true);
+	}
+	
+	return irradiance;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+vec4 computeIrradianceDynamicVoxel(uint directionIndex, uint offsetIndex)
+{
+	vec4 accumulatedIrradiance = vec4(0.0);
+	uint valueToDecode         = voxelVisibilityDynamic4Byte[offsetIndex + directionIndex];
+    vec4 decodedNormalDistance = decodeHitInformation(valueToDecode);
+
+    // Those cases where the hit of a dynamic object was with geometry not facing the directon of the ray, or not lit have distance value -1.0
+    if(decodedNormalDistance.w <= 0.0)
+    {
+        return vec4(0.0, 0.0, 0.0, 1.0); // Put dynamic occlusion in general irradiance to be abe to count how many dynamic voxels give irradiance
+    }
+
+    vec3 samplingDirection       = rayDirection[g_axisIndex * NUMBER_DESIRED_POINT + directionIndex].xyz;
+    vec3 hitPositionDynamicVoxel = g_rayOrigin + samplingDirection * decodedNormalDistance.w;
+    ivec3 coordinates            = worldToVoxelSpaceInteger(hitPositionDynamicVoxel);
+    uint hashedIndex             = uint(getHashedIndex(coordinates));
+    vec3 hitSampleNormal         = decodedNormalDistance.xyz;
+    accumulatedIrradiance        = voxelToVoxelIrradianceBasic(hitPositionDynamicVoxel, coordinates, hitSampleNormal, true, true, false);
+
+    if(record)
+    {
+        lightBounceVoxelDebug[counter++] = 2100.0;
+        lightBounceVoxelDebug[counter++] = float(accumulatedIrradiance.x);
+        lightBounceVoxelDebug[counter++] = float(accumulatedIrradiance.y);
+        lightBounceVoxelDebug[counter++] = float(accumulatedIrradiance.z);
+        lightBounceVoxelDebug[counter++] = 2400.0;
+    }
+
+  	return accumulatedIrradiance;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+vec4 computeIrradianceStaticVoxel(uint directionIndex, uint offsetIndex)
+{
+	vec4 accumulatedIrradiance  = vec4(0.0, 0.0, 0.0, 1.0);
+	uint valueToDecode          = uint(voxelVisibility4Bytes[offsetIndex + directionIndex]);
+    vec4 decodedNormalDistance  = decodeHitInformation(valueToDecode);
+
+    if(valueToDecode != UINT_MAX_VALUE)
+    {
+        vec3 samplingDirection      = rayDirection[g_axisIndex * NUMBER_DESIRED_POINT + directionIndex].xyz;
+        vec3 hitPositionStaticVoxel = g_rayOrigin + samplingDirection * decodedNormalDistance.w;
+        ivec3 coordinates           = worldToVoxelSpaceInteger(hitPositionStaticVoxel);
+        uint hashedIndex0           = uint(getHashedIndex(coordinates));
+        vec3 hitSampleNormal        = decodedNormalDistance.xyz;        
+
+        if(isVoxelLit(hashedIndex0)) // TODO: Enter here only if the proper voxel faces are lit
+        {
+            accumulatedIrradiance = voxelToVoxelIrradianceBasic(hitPositionStaticVoxel, coordinates, hitSampleNormal, true, false, false);
+
+            if(record)
+		    {
+        		lightBounceVoxelDebug[counter++] = 3050.0;
+        	}
+        }
+        else if(isVoxelOccupied(hashedIndex0))
+        {
+            // ADD HERE LOGIC IN CASE STATIC VOXEL SEES ENVIRONMENT, UINT_MAX_VALUE, COMPARE DATA WITH INITIAL DATA AND MAKE SURE IT MAKES SENSE
+            // IMPORTANT: NOW THT THE REAL HIT POINTS ARE KNOWN FOR STATIC AND DYNAMIC VOXEL VISIBILITY, 
+            // REPLACE AND SIMPLIFY COMPUTATIONS USING THOSE VALUES INSTEAD OF ROUNDED VOXEL COORDINATES
+            float voxelSizeWorldSpace = g_sceneExtent.x / g_voxelSize;
+            float thresholdDistance   = voxelSizeWorldSpace * float(THRESHOLD_DISTANCE_VOXEL_MULTIPLIER);
+            accumulatedIrradiance     = irradianceFromAnyLitCloseNeighbourStatic(coordinates, hitSampleNormal, thresholdDistance);
+
+            if(record)
+		    {
+        		lightBounceVoxelDebug[counter++] = 3075.0;
+        	}
+        }            
+    }
+
+    if(record)
+    {
+        lightBounceVoxelDebug[counter++] = 3100.0;
+        lightBounceVoxelDebug[counter++] = float(accumulatedIrradiance.x);
+        lightBounceVoxelDebug[counter++] = float(accumulatedIrradiance.y);
+        lightBounceVoxelDebug[counter++] = float(accumulatedIrradiance.z);
+        lightBounceVoxelDebug[counter++] = 3400.0;
+    }
+
+    return accumulatedIrradiance;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

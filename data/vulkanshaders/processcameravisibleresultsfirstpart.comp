@@ -1,0 +1,143 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#extension GL_EXT_shader_8bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+	// WARNING 4 32-bit ALLIGNMENT
+	uint localWorkGroupsXDimension; //!< Dispatch command x dimension size
+	uint localWorkGroupsYDimension; //!< Dispatch command y dimension size 
+	uint numberElementToProcess;    //!< Maximum number of elements to process
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used as atomic counter for the static voxels visible from camera */
+layout (binding = 1) buffer coherent staticVoxelVisibleCounterBuffer
+{
+   uint staticVoxelVisibleCounter;
+} myStaticVoxelVisibleCounterBuffer;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used as atomic counter for the static voxels visible from camera */
+layout (binding = 2) buffer coherent dynamicVoxelVisibleCounterBuffer
+{
+   uint dynamicVoxelVisibleCounter;
+} myDynamicVoxelVisibleCounter;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer where to flag whether a voxel is visible from the camera as in m_cameraVisibleVoxelBuffer but with all the visible
+* from camera voxel hashed indices starting from index 0 */
+layout (binding = 3) buffer coherent cameraVisibleVoxelCompactedBuffer
+{
+   uint cameraVisibleVoxelCompacted[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to store all the dynamically generated voxels that are visible from camera, this buffer has
+* size DynamicVoxelCopyToBufferTechnique::m_maxDynamicVoxel */
+layout (binding = 4) buffer coherent cameraVisibleDynamicVoxelBuffer
+{
+    uint cameraVisibleDynamicVoxel[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for debug purposes */
+layout (binding = 5) buffer coherent processCameraVisibleResultsDebugBuffer
+{
+    float processCameraVisibleResultsDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer of camera visible test static voxels having information on a per-byte approach (each byte of the buffer has information whether a 
+* dynamic voxel is vislbe from camera or not, representing each byte's index in the buffer the hashed index of a voxel's coordinates) */
+layout (binding = 6) buffer coherent cameraVisibleVoxelPerByteBuffer
+{
+    uint8_t cameraVisibleVoxelPerByte[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer which will be used in ProcessCameraVisibleResultsTechnique to take all the occupied voxels from cameraVisibleDynamicVoxelPerByteBuffer 
+* and set those and their neighbouring voxels for processing */
+layout (binding = 7) buffer coherent cameraVisibleDynamicVoxelPerByteTagProcessBuffer
+{
+    uint8_t cameraVisibleDynamicVoxelPerByteTagProcess[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used to tag those 2^3 tiles in the voxelization volume which have at least one 
+* empty voxel that has at least one neighbour occupied static voxel that need padding to be computed */
+layout (binding = 8) buffer coherent irradiancePaddingTagTilesBuffer
+{
+    uint8_t irradiancePaddingTagTiles[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used to tag those 2^3 tiles in the voxelization volume which have at least one 
+* occupied voxel that will be processed for filtering together with neighbouring voxels */
+layout (binding = 9) buffer coherent irradianceFilteringTagTilesBuffer
+{
+    uint8_t irradianceFilteringTagTiles[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to the instance of the m_irradiancePaddingTagTilesCounterBuffer buffer used to count how many 
+* tiles are being tagged to be used in the padding computation step */
+layout (binding = 10) buffer coherent irradiancePaddingTagTilesCounterBuffer
+{
+    uint irradiancePaddingTagTilesCounter;
+} myIrradiancePaddingTagTilesCounter;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to the instance of the m_irradiancePaddingTagTilesIndexBuffer buffer used to store the indices of 
+* the tiles that need to be processed for the padding computation */
+layout (binding = 11) buffer coherent irradiancePaddingTagTilesIndexBuffer
+{
+    uint irradiancePaddingTagTilesIndex[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to count how many tiles are being tagged to be used in the filtering computation step */
+layout (binding = 12) buffer coherent irradianceFilteringTagTilesCounterBuffer
+{
+    uint irradianceFilteringTagTilesCounter;
+} myIrradianceFilteringTagTilesCounter;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used to store the indices of the tiles that need to be processed for the filtering computation */
+layout (binding = 13) buffer coherent irradianceFilteringTagTilesIndexBuffer
+{
+    uint irradianceFilteringTagTilesIndex[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////

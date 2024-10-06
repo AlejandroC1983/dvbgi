@@ -1,0 +1,118 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+	// WARNING 4 32-bit ALLIGNMENT
+	uint localWorkGroupsXDimension; //!< Number of dispatched local workgroups in the x dimension
+	uint localWorkGroupsYDimension; //!< Number of dispatched local workgroups in the y dimension
+	uint numThreadExecuted;         //!< Number of threads executed
+	uint voxelizationResolution;    //!< Size of the voxelization resolution texture
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 1) buffer coherent voxelOccupiedBuffer
+{
+	uint voxelOccupied[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 3) buffer coherent occupiedStaticVoxelTileBuffer
+{
+    uint occupiedStaticVoxelTile[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Member variable with the value in the m_occupiedStaticVoxelTileCounterBuffer buffer */
+layout (binding = 4) buffer coherent occupiedStaticVoxelTileCounterBuffer
+{
+    uint occupiedStaticVoxelTileCounter;
+} myOccupiedStaticVoxelTileCounterBuffer;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for debug purposes */
+layout (binding = 5) buffer coherent occupiedStaticDebugBuffer
+{
+    float occupiedStaticDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+int   g_voxelSizeInt;   //!< Size of the voxelization texture
+float g_voxelSizeFloat; //!< Size of the voxelization texture
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupied if the current voxel is occupied by at least one fragment, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupied(uint indexHashed)
+{
+    float integerPart;
+    float indexDecimalFloat = float(indexHashed) / 32.0;
+    float fractional        = modf(indexDecimalFloat, integerPart);
+    uint index              = uint(integerPart);
+    uint bit                = uint(fractional * 32.0);
+    bool result             = ((voxelOccupied[index] & (1 << bit)) > 0);
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** hashed value for texture coordinates given as parameter in a voxelization of size given by g_voxelSizeInt
+* @param texcoord  [in] texture coordinates
+* @param voxelSize [in] voxelization size
+* @return hashed value */
+uint getHashedIndex(ivec3 texcoord)
+{
+    return texcoord.x * g_voxelSizeInt * g_voxelSizeInt + texcoord.y * g_voxelSizeInt + texcoord.z;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the tile 3D position given with hashed value as parameter
+* @param value [in] tile index value to unhash
+* @return unhashed tile value for parameter value */
+ivec3 unhashTileValue(uint value)
+{
+    float voxelSizeHalf = g_voxelSizeFloat / float(TILE_SIDE);
+    float number        = float(value) / voxelSizeHalf;
+
+    ivec3 result;
+    float integerPart;
+    float fractional = modf(number, integerPart);
+    result.z         = int(fractional * voxelSizeHalf);
+    number          /= voxelSizeHalf;
+    fractional       = modf(number, integerPart);
+    result.y         = int(fractional * voxelSizeHalf);
+    result.x         = int(integerPart);
+
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

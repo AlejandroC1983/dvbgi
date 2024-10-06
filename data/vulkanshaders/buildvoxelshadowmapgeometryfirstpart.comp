@@ -1,0 +1,90 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+    // WARNING 4 32-bit ALLIGNMENT
+    uint localWorkGroupsXDimension; //!< Dispatch command x dimension size
+    uint localWorkGroupsYDimension; //!< Dispatch command y dimension size
+    uint numElement;                //!< Number of elements to process
+    uint dummyValue;                //!< Padding dummy alue to match 4 32-bit element sets
+    vec4 voxelizationSize;          //!< Size of the texture used for voxelization
+    vec4 sceneMin;                  //!< Scene minimum value
+    vec4 sceneExtent;               //!< Extent of the scene. Also, w value is used to distinguish between rasterization of reflectance or normal information
+    vec4 voxelSize;                 //!< Voxel size in world space taking into account a scene that might have an AABB with different values in the x, y and z axes.
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the hashed position of the 3D volume voxelization coordinates the fragment
+* data in the same index at the voxelFirstIndexCompactedBuffer buffer
+* occupied initially in the non-compacted buffer */
+layout (binding = 1) buffer coherent voxelHashedPositionCompactedBuffer
+{
+    uint voxelHashedPositionCompacted[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the vertex information for the mesh built for the voxel shadow mapping technique */
+layout (binding = 2) buffer coherent shadowMapGeometryVertexBuffer
+{
+    float shadowMapGeometryVertex[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+vec3 unhashValue(uint value)
+{
+    float sizeFloat  = float(myMaterialData.voxelizationSize.x);
+    float number     = float(value) / sizeFloat;
+
+    uvec3 result;
+    float integerPart;
+    float fractional = modf(number, integerPart);
+    result.z         = uint(fractional * sizeFloat);
+    number          /= sizeFloat;
+    fractional       = modf(number, integerPart);
+    result.y         = uint(fractional * sizeFloat);
+    result.x         = uint(integerPart);
+
+    return vec3(float(result.x), float(result.y), float(result.z));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes world space coordinates for 3D texture coordinates
+* @param voxelCoordinates [in] texture coordinates
+* @return world coordinates of the voxel coordinates given as parameter */
+vec3 voxelSpaceToWorldFloat(vec3 voxelCoordinates)
+{
+    vec3 result = voxelCoordinates;
+    result     /= myMaterialData.voxelizationSize.xyz;
+    result     *= myMaterialData.sceneExtent.xyz;
+    result     += myMaterialData.sceneMin.xyz;
+    result     += (myMaterialData.sceneExtent.xyz / myMaterialData.voxelizationSize.x) * 0.5;
+
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

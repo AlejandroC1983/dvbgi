@@ -1,0 +1,471 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#extension GL_EXT_shader_atomic_float : require
+#extension GL_EXT_shader_8bit_storage : enable
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+	// WARNING 4 32-bit ALLIGNMENT
+	uint localWorkGroupsXDimension;   //!< Dispatch command x dimension size
+	uint localWorkGroupsYDimension;   //!< Dispatch command y dimension size
+	uint numThreadExecuted;           //!< Number of thread dispatched
+	uint numberThreadPerElement;      //!< Number of thread needed per element
+	vec4 sceneMin;                    //!< Scene min
+	vec4 sceneExtentAndVoxelSize;     //!< Extent of the scene in the xyz coordinates, voxelization texture size in the w coordinate
+	vec4 lightPosition;               //!< Light position in world coordinates, (formFactorVoxelToVoxelAdded in the w component, equivalent to FORM_FACTOR_VOXEL_TO_VOXEL_ADDED)
+	vec4 lightForwardEmitterRadiance; //!< Light forward direction in xyz components, emitter radiance in w component
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to store all the dynamically generated voxels that are visible from camera, this buffer has
+* size DynamicVoxelCopyToBufferTechnique::m_maxDynamicVoxel */
+layout (binding = 1) buffer coherent cameraVisibleDynamicVoxelBuffer
+{
+    uint cameraVisibleDynamicVoxel[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to store all the visibility information for each of the camera visible dynamic voxels present in the 
+* cameraVisibleDynamicVoxelBuffer buffer */
+layout (binding = 2) buffer coherent dynamicVoxelVisibilityBuffer
+{
+    uint dynamicVoxelVisibility[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Pointer to buffer with the per voxel face directions (128) to rebuild the position of the ray intersected */
+layout (binding = 3) buffer coherent rayDirectionBuffer
+{
+    vec4 rayDirection[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for debug purposes */
+layout (binding = 4) buffer coherent lightBounceDynamicVoxelIrradianceDebugBuffer
+{
+    float lightBounceDynamicVoxelIrradianceDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer of camera visible test static voxels having information on a per-byte approach (each byte of the buffer has information whether a 
+* dynamic voxel is vislbe from camera or not, representing each byte's index in the buffer the hashed index of a voxel's coordinates) */
+layout (binding = 5) buffer coherent dynamicIrradianceTrackingBuffer
+{
+    uint8_t dynamicIrradianceTracking[ ];
+};
+
+////////////////////////////////////////////////////////////////////////////////////
+
+layout(binding = 6,  r11f_g11f_b10f) uniform coherent volatile image3D irradiance3DDynamicNegativeX;
+layout(binding = 7,  r11f_g11f_b10f) uniform coherent volatile image3D irradiance3DDynamicPositiveX;
+layout(binding = 8,  r11f_g11f_b10f) uniform coherent volatile image3D irradiance3DDynamicNegativeY;
+layout(binding = 9,  r11f_g11f_b10f) uniform coherent volatile image3D irradiance3DDynamicPositiveY;
+layout(binding = 10,  r11f_g11f_b10f) uniform coherent volatile image3D irradiance3DDynamicNegativeZ;
+layout(binding = 11, r11f_g11f_b10f) uniform coherent volatile image3D irradiance3DDynamicPositiveZ;
+layout(binding = 12, r32ui) uniform coherent volatile uimage3D voxelizationReflectance;
+layout(binding = 13, r32ui) uniform coherent volatile uimage3D dynamicVoxelizationReflectanceTexture;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// DEFINES
+#define NUMBER_DESIRED_POINT                     128
+#define NUMBER_THREAD_PER_LOCAL_WORKGROUP         64
+#define MIN_IRRADIANCE_VALUE                       0.01
+#define PI                                         3.14159265359
+#define NUM_VOXEL_FACE_FLOAT                       6.0
+#define NUMBER_DIRECTION                           6
+#define MAX_VALUE_UINT                    4294967295
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+float g_voxelSize;                     //!< Size of the voxelization texture
+int   g_voxelSizeInt;                  //!< Size of the voxelization texture
+vec3  g_sceneExtent;                   //!< Scene extent
+vec3  g_sceneMin;                      //!< Scene AABB min value
+vec3  g_voxelWorldCoordinates;         //!< Analyzed voxel world coordinates
+ivec3 g_voxelTextureCoordinates;       //!< Analyzed voxel texture coordinates
+uint  g_textVoxelHashedPosition;       //!< Hashed coordinates of the analyzed voxel
+vec3  g_voxelNormal;                   //!< Voxel normal
+float g_voxelSizeWorldSpace;           //!< Size of a voxel in world space coordinates, assuming g_sceneExtent has the sam evalue on ALL fields
+vec3  g_voxelWorldHalfDiagonal;        //!< Size of half the diagonal of a voxel
+int g_axisIndex;                       //!< Voxel face index, with {0,1,2,3,4,5} meaning {-x, +x, -y, +y, -z, +z}
+vec3  g_emitterForwardDirection;       //!< Emitter direction
+vec3  g_emitterPosition;               //!< Emitter position in world coordinates
+bool record;
+uint counter;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// SHARED VARIABLES
+shared vec4 g_irradiance[NUMBER_THREAD_PER_LOCAL_WORKGROUP];
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** One of the precomputed directions to compare with the normal direction of the fragment, to ray
+* march on voxel space in the search of lit voxels
+* Three 15 elements per dirfection */
+vec3 arrayVoxelRayDirection[NUMBER_DIRECTION] =
+{
+	vec3(-1.0,  0.0,  0.0), // Negative x
+	vec3( 1.0,  0.0,  0.0), // Positive x
+	vec3( 0.0, -1.0,  0.0), // Negative y
+	vec3( 0.0,  1.0,  0.0), // Positive y
+	vec3( 0.0,  0.0, -1.0), // Negative z
+	vec3( 0.0,  0.0,  1.0)  // Positive z
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+vec3 arrayDirections[6] = {
+    vec3(-1.0,  0.0,  0.0),
+    vec3( 1.0,  0.0,  0.0),
+    vec3( 0.0, -1.0,  0.0),
+    vec3( 0.0,  1.0,  0.0),
+    vec3( 0.0,  0.0, -1.0),
+    vec3( 0.0,  0.0,  1.0)
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+ivec3 unhashValue(uint value)
+{
+    float number     = float(value) / g_voxelSize;
+
+    ivec3 result;
+    float integerPart;
+    float fractional = modf(number, integerPart);
+    result.z         = int(fractional * g_voxelSize);
+    number          /= g_voxelSize;
+    fractional       = modf(number, integerPart);
+    result.y         = int(fractional * g_voxelSize);
+    result.x         = int(integerPart);
+
+    return result;
+}
+
+////////////////////////////////////////////////////////////////////////////////////
+
+/** Decode a normal with information in the first 16 bits of a 32-bit uint
+* with bits 0-6 for the x component, bit 7-13 for the y component, and bit 14 for the
+* z component sign (value 0 means negative, value 1, positive).
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ 
+* 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ 
+*    |s||   y component     ||   x component    |
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ 
+*/
+vec3 decodeNormalXYFloatToUInt7Bit(uint normal)
+{
+	uint xValue      =   0x0000007F & normal;
+	uint yValue      =  (0x00003F80 & normal) >> 7;
+	bool zPositive   = ((0x00004000 & normal) > 0);
+	vec3 resultFloat = vec3(float(xValue) / 127.0, float(yValue) / 127.0, 0.0);
+
+	resultFloat.x   -= 0.5;
+	resultFloat.x   *= 2.0;
+	resultFloat.y   -= 0.5;
+	resultFloat.y   *= 2.0;
+
+	resultFloat.x    = clamp(resultFloat.x, -1.0, 1.0);
+	resultFloat.y    = clamp(resultFloat.y, -1.0, 1.0);
+	float operand    = resultFloat.x * resultFloat.x + resultFloat.y * resultFloat.y;
+	operand          = clamp(operand, 0.0, 1.0);
+	resultFloat.z    = sqrt(1.0 - operand);
+
+	resultFloat.z   *= zPositive ? 1.0 : -1.0;
+
+	return normalize(resultFloat);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Decode from a 4 bytes uint the distance value (from the voxel center to the hit position) as a 16 bit 
+* float (in the bits 16-31) and a normal direction encoded using 7 bit integer approximation of the x and y 
+* normal direction components in the bits 0-14. Bit 15 is a flag to know if the intersected geometry is dynamic.
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __
+* 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __
+* |d||s||   y component     ||   x component    |
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __
+* @param hitInformation    [in]    hit information to decode
+* @param isDynamicGeometry [inout] boolean value to know whether the intersected goemetry is dynamic
+* @return vec4 with normal direction in xyz fields and distance information in w field */
+vec4 decodeHitInformation(in uint hitInformation, inout bool isDynamicGeometry)
+{
+	vec2 distanceInfo = unpackHalf2x16(hitInformation);
+	vec3 normalInfo   = decodeNormalXYFloatToUInt7Bit(hitInformation);
+	isDynamicGeometry = ((hitInformation & 0x00008000) > 0);
+
+    return vec4(normalInfo.x, normalInfo.y, normalInfo.z, distanceInfo.y);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes world space coordinates for 3D texture coordinates
+* @param coordinates [in] texture coordinates
+* @return world coordinates of the voxel coordinates given as parameter */
+vec3 voxelSpaceToWorld(ivec3 coordinates)
+{
+	vec3 result = vec3(float(coordinates.x), float(coordinates.y), float(coordinates.z));
+	result     /= vec3(g_voxelSize);
+	result     *= g_sceneExtent;
+	result     += g_sceneMin;
+	result     += (g_sceneExtent / g_voxelSize) * 0.5;
+	return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns the form factor from a differential area with normal normalDA and to a
+* differential area with position positionDB and normal normalDB
+* NOTE: taken from J. R. Wallace, K. A. Elmquist, and E. A. Haines. 1989. A Ray tracing algorithm for progressive radiosity
+* @param normalDA   [in] Normal of the differential area A
+* @param positionDA [in] Point position of the differential area A
+* @param normalDB   [in] Normal of the differential area B
+* @param positionDB [in] Point position of the differential area B
+* @param isDynamic  [in] floag to know if the computation being done has a dynamic voxel involved
+* @return form factor value */
+float differentialAreaFormFactor(vec3 normalDA, vec3 positionDA, vec3 normalDB, vec3 positionDB, bool isDynamic)
+{
+	vec3 dAtoDiskDirection = positionDB - positionDA;
+	float distanceSq       = dot(dAtoDiskDirection, dAtoDiskDirection);
+	dAtoDiskDirection      = normalize(dAtoDiskDirection);
+	float cosTheta1        = dot(normalDA, dAtoDiskDirection);
+	cosTheta1              = clamp(cosTheta1, 0.0, 1.0);
+	float cosTheta2        = dot(normalDB, -1.0 * dAtoDiskDirection);
+	cosTheta2              = clamp(cosTheta2, 0.0, 1.0);
+	distanceSq             = max(distanceSq, float(MIN_SQUARED_DISTANCE_FORM_FACTOR_DYNAMIC) / 10.0);
+
+	// To avoid close points reach too high values due to the form factor formula
+	float nSamples = 0.0;
+
+#ifdef ADD_EXTRA_VALUE_FORM_FACTOR
+	float distanceAttenuationStart = 25.0;
+	float distanceBetweenPoints    = distance(positionDA, positionDB);
+	distanceBetweenPoints          = clamp(distanceBetweenPoints, 0.0, distanceAttenuationStart);
+
+	if(isDynamic)
+	{
+		nSamples = 6000.0 * (1.0 - (distanceBetweenPoints / distanceAttenuationStart))  * (1.0 - (distanceBetweenPoints / distanceAttenuationStart));
+	}
+	else
+	{
+		nSamples = 100000.0 * (distanceBetweenPoints / distanceAttenuationStart) * (distanceBetweenPoints / distanceAttenuationStart);
+	}
+#endif // ADD_EXTRA_VALUE_FORM_FACTOR
+
+	return (cosTheta1 * cosTheta2) / (PI * distanceSq + nSamples);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+vec3 offsetVoxelCoordinates(vec3 sufraceHitNormal, vec3 voxelCenter)
+{
+    vec3 projectedSurfaceHitNormal;
+
+    switch (g_axisIndex)
+    {
+        case 0: case 1:
+        {
+            projectedSurfaceHitNormal = vec3(0.0, sufraceHitNormal.y, sufraceHitNormal.z); // YZ plane projection
+            break;
+        }
+        case 2: case 3:
+        {
+            projectedSurfaceHitNormal = vec3(sufraceHitNormal.x, 0.0, sufraceHitNormal.z); // XZ plane projection
+            break;
+        }
+        case 4: case 5:
+        {
+            projectedSurfaceHitNormal = vec3(sufraceHitNormal.x, sufraceHitNormal.y, 0.0); // XY plane projection
+            break;
+        }
+    }
+
+    if (length(projectedSurfaceHitNormal) == 0.0)
+    {
+        return voxelCenter;
+    }
+
+    projectedSurfaceHitNormal = normalize(projectedSurfaceHitNormal);
+
+    return voxelCenter + projectedSurfaceHitNormal * g_voxelWorldHalfDiagonal;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+vec4 convRGBA8ToVec4New(uint val)
+{
+    return vec4(float((val&0x000000FF)), float((val&0x0000FF00)>>8U), float ((val&0x00FF0000)>>16U), float((val&0xFF000000)>>24U));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes texture space coordinates of the world coordinates given as parameter
+* @param worldCoordinates [in] world coordinates
+* @return texture space coordinates of the world coordinates given as parameter */
+ivec3 worldToVoxelSpaceInteger(vec3 worldCoordinates)
+{
+    vec3 result = worldCoordinates;
+    result     -= g_sceneMin;
+    result     /= g_sceneExtent;
+    result     *= vec3(g_voxelSize);
+
+    return ivec3(int(result.x), int(result.y), int(result.z));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Compute the reflected irradiance from a directional emitter with direction lightDirection (from the surface being analysed)
+* for a lambertian surface with normal direction surfaceNormal
+* https://bheisler.github.io/post/writing-raytracer-in-rust-part-2/
+* https://www.scratchapixel.com/lessons/3d-basic-rendering/introduction-to-shading/diffuse-lambertian-shading.html
+* @param lightDirection  [in] direction towards the light
+* @param surfaceNormal   [in] normal direction of the surface being analysed
+* @param emitterRadiance [in] emitter radiance
+* @return form factor value */
+float reflectedIrradianceDirectionalLight(vec3 lightDirection, vec3 surfaceNormal, float emitterRadiance)
+{
+    float reflectedIrradiance = dot(lightDirection, surfaceNormal);
+    reflectedIrradiance      *= emitterRadiance;
+    reflectedIrradiance      /= PI;
+    
+    return reflectedIrradiance;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+float computeOcclusionFromDistance()
+{
+	return 1.0;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes irradiance ariving at voxel at g_voxelWorldCoordinates from lighrt bouncing at tempWorldCoordinates
+* given by the reflectance parameter
+* towards the voxel g_voxelTextureCoordinates being analysed
+* @param tempWorldCoordinates      [in] hit world coordinates
+* @param surfaceNormal             [in] normal direction for the surface associated to the voxel
+* @param isIntersectedVoxelDynamic [in] flag to know whether the intersected voxel is dynamic or not
+* @return irradiance ariving at voxel at g_voxelWorldCoordinates from lighrt bouncing at tempWorldCoordinates */
+vec4 voxelToVoxelIrradianceBasic(vec3 tempWorldCoordinates, vec3 surfaceNormal, bool isIntersectedVoxelDynamic)
+{
+    // First test if the emitter is visible from the hit point
+    ivec3 voxelCoordinated = worldToVoxelSpaceInteger(tempWorldCoordinates);
+    uint voxelReflectanceUint;
+    if(isIntersectedVoxelDynamic)
+    {
+        voxelReflectanceUint = imageLoad(dynamicVoxelizationReflectanceTexture, voxelCoordinated).r;
+    }
+    else
+    {
+        voxelReflectanceUint = imageLoad(voxelizationReflectance, voxelCoordinated).r;
+    }
+
+    // Assume the normal direction of the neuighbouring voxel is the same as the original voxel
+    vec3 voxelReflectance  = convRGBA8ToVec4New(voxelReflectanceUint).xyz;
+    float emitterRadiance  = myMaterialData.lightForwardEmitterRadiance.w;
+
+    // Offset the voxel position from where the irradiance is being computed
+    vec3 voxelWorldCoordinatesOffset       = offsetVoxelCoordinates(surfaceNormal.xyz, g_voxelWorldCoordinates);
+    // Offset the surface hit in theopposite direction of the surface normal (currently, the two voxel positions in worl coordinates would be taken into consideration)
+    vec3 voxelRayHitWorldCoordinatesOffset = offsetVoxelCoordinates(-1.0 * surfaceNormal.xyz, tempWorldCoordinates);
+
+    float reflectedIrradiance              = reflectedIrradianceDirectionalLight(normalize(g_emitterPosition), surfaceNormal, emitterRadiance);
+    float formFactorVoxel0                 = differentialAreaFormFactor(g_voxelNormal, voxelWorldCoordinatesOffset, surfaceNormal.xyz, voxelRayHitWorldCoordinatesOffset, isIntersectedVoxelDynamic);
+
+    // If the angle between the surface normal negated and the voxel normal is bigger than 105 degrees, compute a normal direction thar favours irradiance
+    // -0.26 is cos(1.8332 rads) which is 105 degrees
+    float cosAngleSurfaceNormalEmitterDirection = dot(surfaceNormal, normalize(g_emitterPosition - tempWorldCoordinates));
+
+    if(record)
+    {
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(4100.0);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(tempWorldCoordinates.x);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(tempWorldCoordinates.y);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(tempWorldCoordinates.z);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(4125.0);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(surfaceNormal.x);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(surfaceNormal.y);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(surfaceNormal.z);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(4150.0);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = isIntersectedVoxelDynamic ? 1.0 : -1.0;
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(4175.0);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(voxelCoordinated.x);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(voxelCoordinated.y);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(voxelCoordinated.z);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(4200.0);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(voxelReflectance.x);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(voxelReflectance.y);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(voxelReflectance.z);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(4225.0);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(voxelWorldCoordinatesOffset.x);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(voxelWorldCoordinatesOffset.y);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(voxelWorldCoordinatesOffset.z);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(4250.0);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(voxelRayHitWorldCoordinatesOffset.x);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(voxelRayHitWorldCoordinatesOffset.y);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(voxelRayHitWorldCoordinatesOffset.z);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(4275.0);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(reflectedIrradiance);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(formFactorVoxel0);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(cosAngleSurfaceNormalEmitterDirection);
+        lightBounceDynamicVoxelIrradianceDebug[counter++] = float(4300.0);
+    }
+
+    if(cosAngleSurfaceNormalEmitterDirection < -0.1)
+    {
+        return vec4(0.0, 0.0, 0.0, 1.0);
+    }
+
+    // In some cases, the normal direction from the hit point from the voxel face ,surfaceNormal, is nor representative of the majority of the gometry being intersected, with normal
+    // directions that vary a lot from one voxel to another. Takking the maximum value of the forma factor betwen the normal direction data and a computed surface normal midway between
+    // the directions from the sample to the emitter and from the sample to the voxel whose irradiance per face is being computed is a try to minimize that variation of sampled surface normals.
+    vec3 currentIrradiance          = reflectedIrradiance * formFactorVoxel0 * emitterRadiance * voxelReflectance;
+    float irradianceVectorLength    = length(currentIrradiance);
+    float maxIrradiancevectorLength = float(MAX_IRRADIANCE_ALL_TO_DYNAMIC_VECTOR_LENGTH) / 100.0;
+
+    if(irradianceVectorLength > maxIrradiancevectorLength)
+    {
+        currentIrradiance /= irradianceVectorLength;
+        currentIrradiance *= maxIrradiancevectorLength;
+    }
+
+    if(dot(currentIrradiance.xyz, vec3(1.0)) > 0.01)
+    {
+        return vec4(currentIrradiance.xyz, 1.0);
+    }
+
+    vec4(0.0, 0.0, 0.0, computeOcclusionFromDistance());
+    //vec4(0.0, 0.0, 0.0, 1.0);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

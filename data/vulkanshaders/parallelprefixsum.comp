@@ -1,0 +1,326 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform sceneElementTransform
+{
+	mat4 model;
+} mySceneElementTransform;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 1) uniform sceneCamera
+{
+	mat4 view;
+	mat4 projection;
+	vec4 sceneOffset;
+	vec4 sceneExtent;
+} mySceneCamera;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Information about the number of levels required to apply the prefix sum parallel algorithm to the 
+* bufferHistogramBuffer buffer. The maximum number of elements in bufferHistogramBuffer is 536862720,
+* given that each thread processes 128 elements of bufferHistogramBuffer in the initial pass, up to
+* four levels are needed to complete the algorithm. */
+layout (binding = 2) uniform materialData
+{
+	uint prefixSumTotalSize;     //!< Number of levels of the prefix sum parallel sum
+	uint numElementBase;         //!< Number of elements for the base step of the reduce phase of the algorithm (reading from m_voxelFirstIndexBuffer)
+	uint numElementLevel0;       //!< Number of elements for the step number 0 of the reduce phase of the algorithm
+	uint numElementLevel1;       //!< Number of elements for the step number 1 of the reduce phase of the algorithm
+	uint numElementLevel2;       //!< Number of elements for the step number 2 of the reduce phase of the algorithm
+	uint numElementLevel3;       //!< Number of elements for the step number 3 of the reduce phase of the algorithm
+	uint currentStep;            //!< Index with the current step being done in the algorithm. At level 0, the number of elements to process is given by prefixSumNumElementBase, and from level one, by prefixSumNumElementLeveli
+	uint currentPhase;           //!< 0 means reduction step, 1 sweep down, 2 write final compacted buffer
+	uint numberStepsDownSweep;   //!< Number of steps of the down sweep phase of the algorithm
+	uint indirectionBufferRange; //!< Number of elements covered by each index in the compactedBufferIndirectionBuffer
+	uint voxelizationWidth;      //!< Width of the voxelization volume
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know the number of non-empty elements in voxelFirstIndexBuffer found by each thread
+* layout (binding = 4) buffer coherent bufferHistogramBuffer */
+layout (binding = 3) buffer coherent voxelFirstIndexBuffer
+{
+	uint voxelFirstIndex[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to perform the prefix sum algorithm , starting from the data present in bufferHistogramBuffer */
+layout (binding = 4) buffer coherent prefixSumPlanarBuffer
+{
+	uint prefixSumPlanar[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the hashed position of the 3D volume voxelization coordinates the fragment
+* data in the same index at the voxelFirstIndexCompactedBuffer buffer
+* occupied initially in the non-compacted buffer */
+layout (binding = 6) buffer coherent voxelHashedPositionCompactedBuffer
+{
+	uint voxelHashedPositionCompacted[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for accelerating the search of elements in voxelFirstIndexCompactedBuffer and
+* voxelHashedPositionCompactedBuffer. Contains the index to the first element in
+* voxelFirstIndexCompactedBuffer and voxelHashedPositionCompactedBuffer for fixed
+* 3D voxelization values, like (0,0,0), (0,0,128), (0,1,0), (0,1,128), (0,2,0), (0,2,128), ... */
+layout (binding = 7) buffer coherent IndirectionIndexBuffer
+{
+	uint IndirectionIndex[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for accelerating the search of elements in voxelFirstIndexCompactedBuffer and
+* voxelHashedPositionCompactedBuffer. Contains the amount of elements at the same index in
+* IndirectionIndexBuffer, to know how many elements to the right are there when using the
+* value at the same index of IndirectionIndexBuffe in voxelFirstIndexCompactedBuffer */
+layout (binding = 8) buffer coherent IndirectionRankBuffer
+{
+	uint IndirectionRank[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout(binding = 9, r32ui) uniform coherent volatile uimage3D staticVoxelIndexTexture;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// DEFINES
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+const uint maxValue                    = 4294967295;
+const uint numElementAnalyzedPerThread = 128;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+uvec3 unhashValue(uint value)
+{
+	float sizeFloat  = float(myMaterialData.voxelizationWidth);
+	float number     = float(value) / sizeFloat;
+
+	uvec3 result;
+	float integerPart;
+	float fractional = modf(number, integerPart);
+	result.z         = uint(fractional * sizeFloat);
+	number          /= sizeFloat;
+	fractional       = modf(number, integerPart);
+	result.y         = uint(fractional * sizeFloat);
+	result.x         = uint(integerPart);
+
+	return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Local workgroup size https://www.khronos.org/registry/vulkan/specs/1.1-extensions/html/vkspec.html called in each invocation group
+* According to Vulkan specs, minimum local workgroup size is (128,128,64), using (8,8,1), performance tests pending */
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main()
+{
+	uint idx = gl_WorkGroupID.x * 64 + gl_WorkGroupID.y * 64 + gl_LocalInvocationIndex;
+
+	if(myMaterialData.currentPhase == 0)
+	{
+		uint arrayMaxIndex[5];
+		arrayMaxIndex[0] = myMaterialData.numElementBase;
+		arrayMaxIndex[1] = myMaterialData.numElementLevel0;
+		arrayMaxIndex[2] = myMaterialData.numElementLevel1;
+		arrayMaxIndex[3] = myMaterialData.numElementLevel2;
+		arrayMaxIndex[4] = myMaterialData.numElementLevel3;
+
+		uint maxIndex = arrayMaxIndex[myMaterialData.currentStep];
+
+		if(idx >= maxIndex)
+		{
+			return;
+		}
+
+		uint arrayInitialIndex[5];
+		arrayInitialIndex[0] = numElementAnalyzedPerThread * idx;
+		arrayInitialIndex[1] = numElementAnalyzedPerThread * idx;
+		arrayInitialIndex[2] = numElementAnalyzedPerThread * idx + myMaterialData.numElementBase;
+		arrayInitialIndex[3] = numElementAnalyzedPerThread * idx + myMaterialData.numElementBase + myMaterialData.numElementLevel0;
+		arrayInitialIndex[4] = numElementAnalyzedPerThread * idx + myMaterialData.numElementBase + myMaterialData.numElementLevel0 + myMaterialData.numElementLevel1;
+
+		const uint initialIndex = arrayInitialIndex[myMaterialData.currentStep];
+
+		uint arrayFinalIndex[5];
+		arrayFinalIndex[0] = initialIndex + numElementAnalyzedPerThread;
+		arrayFinalIndex[1] = initialIndex + min(numElementAnalyzedPerThread, myMaterialData.numElementBase);
+		arrayFinalIndex[2] = initialIndex + min(numElementAnalyzedPerThread, myMaterialData.numElementLevel0);
+		arrayFinalIndex[3] = initialIndex + min(numElementAnalyzedPerThread, myMaterialData.numElementLevel1);
+		arrayFinalIndex[4] = initialIndex + min(numElementAnalyzedPerThread, myMaterialData.numElementLevel2);
+
+		uint arrayThreadWriteIndex[5];
+		arrayThreadWriteIndex[0] = idx;
+		arrayThreadWriteIndex[1] = idx + myMaterialData.numElementBase;
+		arrayThreadWriteIndex[2] = idx + myMaterialData.numElementBase + myMaterialData.numElementLevel0;
+		arrayThreadWriteIndex[3] = idx + myMaterialData.numElementBase + myMaterialData.numElementLevel0 + myMaterialData.numElementLevel1;
+		arrayThreadWriteIndex[4] = idx + myMaterialData.numElementBase + myMaterialData.numElementLevel0 + myMaterialData.numElementLevel1 + myMaterialData.numElementLevel2;
+
+		const uint finalIndex       = arrayFinalIndex[myMaterialData.currentStep];
+		const uint threadWriteIndex = arrayThreadWriteIndex[myMaterialData.currentStep];
+		uint nonNullCounter         = 0;
+
+		if(myMaterialData.currentStep == 0)
+		{
+			for(uint i = initialIndex; i < finalIndex; ++i)
+			{
+				if(voxelFirstIndex[i] != maxValue)
+				{
+					nonNullCounter++;
+				}
+			}
+		}
+		else
+		{
+			for(uint i = initialIndex; i < finalIndex; ++i)
+			{
+				nonNullCounter += prefixSumPlanar[i];
+			}
+		}
+		prefixSumPlanar[threadWriteIndex] = nonNullCounter;
+	}
+	else if(myMaterialData.currentPhase == 1)
+	{
+		uint arrayMaxIndex[5];
+		arrayMaxIndex[0] = uint(ceil(float(myMaterialData.numElementBase) / float(numElementAnalyzedPerThread)));
+		arrayMaxIndex[1] = uint(ceil(float(myMaterialData.numElementLevel0) / float(numElementAnalyzedPerThread)));
+		arrayMaxIndex[2] = uint(ceil(float(myMaterialData.numElementLevel1) / float(numElementAnalyzedPerThread)));
+		arrayMaxIndex[3] = uint(ceil(float(myMaterialData.numElementLevel2) / float(numElementAnalyzedPerThread)));
+		arrayMaxIndex[4] = uint(ceil(float(myMaterialData.numElementLevel3) / float(numElementAnalyzedPerThread)));
+
+		uint maxIndex = arrayMaxIndex[myMaterialData.currentStep];
+
+		if(idx >= maxIndex)
+		{
+			return;
+		}
+
+		uint arrayInitialIndex[5];
+		arrayInitialIndex[0] = numElementAnalyzedPerThread * idx;
+		arrayInitialIndex[1] = numElementAnalyzedPerThread * idx + myMaterialData.numElementBase;
+		arrayInitialIndex[2] = numElementAnalyzedPerThread * idx + myMaterialData.numElementBase + myMaterialData.numElementLevel0;
+		arrayInitialIndex[3] = numElementAnalyzedPerThread * idx + myMaterialData.numElementBase + myMaterialData.numElementLevel0 + myMaterialData.numElementLevel1;
+		arrayInitialIndex[4] = numElementAnalyzedPerThread * idx + myMaterialData.numElementBase + myMaterialData.numElementLevel0 + myMaterialData.numElementLevel1 + myMaterialData.numElementLevel2;
+
+		uint initialIndex = arrayInitialIndex[myMaterialData.currentStep];
+
+		uint arrayFinalIndex[5];
+		arrayFinalIndex[0] = initialIndex + min(numElementAnalyzedPerThread, myMaterialData.numElementBase);
+		arrayFinalIndex[1] = initialIndex + min(numElementAnalyzedPerThread, myMaterialData.numElementLevel0);
+		arrayFinalIndex[2] = initialIndex + min(numElementAnalyzedPerThread, myMaterialData.numElementLevel1);
+		arrayFinalIndex[3] = initialIndex + min(numElementAnalyzedPerThread, myMaterialData.numElementLevel2);
+		arrayFinalIndex[4] = initialIndex + min(numElementAnalyzedPerThread, myMaterialData.numElementLevel3);
+
+		uint previousValue;
+		uint finalIndex = arrayFinalIndex[myMaterialData.currentStep];
+
+		// Don't add the offset from the previous step
+		if((myMaterialData.currentStep + 1) == myMaterialData.numberStepsDownSweep)
+		{
+			uint accumulated              = prefixSumPlanar[initialIndex];
+			prefixSumPlanar[initialIndex] = 0;
+
+			for(uint i = initialIndex + 1; i < finalIndex; ++i)
+			{
+				previousValue      = prefixSumPlanar[i];
+				prefixSumPlanar[i] = accumulated;
+				accumulated       += previousValue;
+			}
+		}
+		else
+		{
+			// Not the first iteration of the algorithm, and not the last, when the results in the first myMaterialData.numElementBase
+			// elements of prefixSumPlanarBuffer are used to build the final compacted buffer from the initial voxelFirstIndexBuffer
+			uint arrayOffsetIndex[5];
+			arrayOffsetIndex[0] = idx + myMaterialData.numElementBase;
+			arrayOffsetIndex[1] = idx + myMaterialData.numElementBase + myMaterialData.numElementLevel0;
+			arrayOffsetIndex[2] = idx + myMaterialData.numElementBase + myMaterialData.numElementLevel0 + myMaterialData.numElementLevel1;
+			arrayOffsetIndex[3] = idx + myMaterialData.numElementBase + myMaterialData.numElementLevel0 + myMaterialData.numElementLevel1 + myMaterialData.numElementLevel2;
+			arrayOffsetIndex[4] = idx + myMaterialData.numElementBase + myMaterialData.numElementLevel0 + myMaterialData.numElementLevel1 + myMaterialData.numElementLevel2 + myMaterialData.numElementLevel3;
+
+			uint previousStepOffsetIndex = arrayOffsetIndex[myMaterialData.currentStep];
+			uint offset                  = prefixSumPlanar[previousStepOffsetIndex];
+			uint accumulated             = 0;
+
+			for(uint i = initialIndex; i < finalIndex; ++i)
+			{
+				previousValue      = prefixSumPlanar[i];
+				prefixSumPlanar[i] = offset + accumulated;
+				accumulated       += previousValue;
+			}
+		}
+	}
+	else if(myMaterialData.currentPhase == 2)
+	{
+		// Last step of the algorithm: loop through the original buffer voxelFirstIndexCompacted and put any element different from
+		// the default alue (given by maxValue) at the proper index taking the swept down index from voxelFirstIndex
+		uint maxIndex = myMaterialData.numElementBase;
+
+		if(idx >= maxIndex)
+		{
+			return;
+		}
+
+		const uint initialIndex = idx * numElementAnalyzedPerThread;
+		const uint finalIndex   = initialIndex + numElementAnalyzedPerThread;
+		const uint offset       = prefixSumPlanar[idx];
+
+		uint counter = 0;
+		for(uint i = initialIndex; i < finalIndex; ++i)
+		{
+			if(voxelFirstIndex[i] != maxValue)
+			{
+				voxelHashedPositionCompacted[offset + counter] = i;
+				uvec3 result                                   = unhashValue(i);
+				uint voxelizationSize                          = myMaterialData.voxelizationWidth;
+				uint indirectionRankValue                      = myMaterialData.indirectionBufferRange;
+				uint index                                     = voxelizationSize * result.x + result.y;
+
+				atomicAdd(IndirectionRank[index], 1);
+
+				uint cur;
+				uint newVal = offset + counter;
+				uint prev   = maxValue;
+				atomicMin(IndirectionIndex[index], offset + counter);
+
+				imageStore(staticVoxelIndexTexture, ivec3(result), uvec4(offset + counter, 0, 0, 0));
+
+				counter++;
+			}
+		}
+	}
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

@@ -1,0 +1,115 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+    const uint NUM_WORKGROUP_Y_DIMENSION = myMaterialData.localWorkGroupsYDimension;
+    uint idx                             = gl_WorkGroupID.x * NUM_WORKGROUP_Y_DIMENSION * THREAD_PER_LOCAL_WORKGROUP + gl_WorkGroupID.y * THREAD_PER_LOCAL_WORKGROUP + gl_LocalInvocationIndex;
+
+    uint boneMatrixOffset                = uint(myPushConstant.pushConstantData.x);
+    uint numVertexToProcess              = uint(myPushConstant.pushConstantData.y);
+    uint currentSkeletalMeshIndex        = uint(myPushConstant.pushConstantData.z);
+    uint vertexOffsetAccumulated         = uint(myPushConstant.pushConstantData.w);
+
+    if(idx >= numVertexToProcess)
+    {
+        return;
+    }
+
+    bool record  = (idx == 25743);
+    uint counter = 0;
+
+    // Load the original vertex data from vertexBufferSkinnedMeshOriginal, using VERTEX_STRIDE raster flag to know the offset to read from. The position data is on the first three float values of the vertex information
+    uint vertexOffset     = VERTEX_STRIDE * (vertexOffsetAccumulated + idx);
+    vec4 vertex           = vec4(uintBitsToFloat(vertexBufferSkinnedMeshOriginalData[vertexOffset + 0]), uintBitsToFloat(vertexBufferSkinnedMeshOriginalData[vertexOffset +  1]), uintBitsToFloat(vertexBufferSkinnedMeshOriginalData[vertexOffset +  2]), 1.0);
+    uint normalUint       = vertexBufferSkinnedMeshOriginalData[vertexOffset + 4];
+    uint tangentUintFlags = vertexBufferSkinnedMeshOriginalData[vertexOffset + 5];
+    uint vertexFlags      = tangentUintFlags & 0xFF000000;
+    
+    vec3 normal      = convRGB8ToVec(normalUint);
+    normal          /= 255.0;
+    normal          -= vec3(0.5);
+    normal          *= 2.0;
+
+    vec3 tangent     = convRGB8ToVec(tangentUintFlags);
+    tangent         /= 255.0;
+    tangent         -= vec3(0.5);
+    tangent         *= 2.0;
+
+    // Load the matrices IDs and matrices weights from skinnedMeshDataBufferData, each vertex has eight values, first four being bone ID information and the remaining four being weight information
+    uint boneDataOffset     = 8 * (vertexOffsetAccumulated + idx);
+    vec4 boneMatrixID       = vec4(skinnedMeshDataBufferData[boneDataOffset + 0], skinnedMeshDataBufferData[boneDataOffset + 1], skinnedMeshDataBufferData[boneDataOffset + 2], skinnedMeshDataBufferData[boneDataOffset + 3]);
+    vec4 boneMatrixWeight   = vec4(skinnedMeshDataBufferData[boneDataOffset + 4], skinnedMeshDataBufferData[boneDataOffset + 5], skinnedMeshDataBufferData[boneDataOffset + 6], skinnedMeshDataBufferData[boneDataOffset + 7]);
+
+    // Load the matrices needed for the vertex transform now the matrix IDs are available
+    mat4 matBone0           = mat4(1.0);
+    mat4 matBone1           = mat4(1.0);
+    mat4 matBone2           = mat4(1.0);
+    mat4 matBone3           = mat4(1.0);
+
+    if(boneMatrixWeight.x > 0.0)
+    {
+        matBone0 = poseMatrix[boneMatrixOffset + uint(boneMatrixID.x)];
+    }
+
+    if(boneMatrixWeight.y > 0.0)
+    {
+        matBone1 = poseMatrix[boneMatrixOffset + uint(boneMatrixID.y)];
+    }
+
+    if(boneMatrixWeight.z > 0.0)
+    {
+        matBone2 = poseMatrix[boneMatrixOffset + uint(boneMatrixID.z)];
+    }
+
+    if(boneMatrixWeight.w > 0.0)
+    {
+        matBone3 = poseMatrix[boneMatrixOffset + uint(boneMatrixID.w)];
+    }
+
+    mat4 matFinal                  = matBone0 * boneMatrixWeight.x + matBone1 * boneMatrixWeight.y + matBone2* boneMatrixWeight.z + matBone3 * boneMatrixWeight.w;
+    mat4 sceneLoadTransform        = sceneLoadTransform[currentSkeletalMeshIndex];
+    mat4 sceneLoadTransformInverse = inverse(sceneLoadTransform);
+
+    vertex                         = sceneLoadTransformInverse            * vertex;
+    vec4 vertexFinal               = sceneLoadTransform        * matFinal * vertex;
+
+    mat3 sceneLoadInverseNormal    = mat3(transpose(inverse(sceneLoadTransform)));
+    vec3 worldNormal               = normalize(sceneLoadInverseNormal * normal);
+    vec3 worldTangent              = normalize(sceneLoadInverseNormal * tangent);
+
+    mat3 boneSpaceSceneLoadNormal  = mat3(transpose(inverse(sceneLoadTransform * matFinal)));
+    worldNormal                    = normalize(boneSpaceSceneLoadNormal * worldNormal);
+    worldTangent                   = normalize(boneSpaceSceneLoadNormal * worldTangent);
+
+    worldNormal                *= 0.5;
+    worldNormal                += vec3(0.5);
+    worldNormal                 = vec3(floor(worldNormal.x * 255.0), floor(worldNormal.y * 255.0), floor(worldNormal.z * 255.0));
+    uint worldNormalCompressed  = convVecToRGB8(worldNormal);
+
+    worldTangent                *= 0.5;
+    worldTangent                += vec3(0.5);
+    worldTangent                = vec3(floor(worldTangent.x * 255.0), floor(worldTangent.y * 255.0), floor(worldTangent.z * 255.0));
+    uint worldTangentCompressed = convVecToRGB8(worldTangent);
+
+    vertexBufferSkinnedMeshData[vertexOffset +  0] = floatBitsToUint(vertexFinal.x);
+    vertexBufferSkinnedMeshData[vertexOffset +  1] = floatBitsToUint(vertexFinal.y);
+    vertexBufferSkinnedMeshData[vertexOffset +  2] = floatBitsToUint(vertexFinal.z);
+
+    vertexBufferSkinnedMeshData[vertexOffset +  4] = worldNormalCompressed;
+    vertexBufferSkinnedMeshData[vertexOffset +  5] = worldTangentCompressed | vertexFlags;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

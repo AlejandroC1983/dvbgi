@@ -1,0 +1,115 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+	const uint NUM_WORKGROUP_Y_DIMENSION = myMaterialData.localWorkGroupsYDimension;
+	const uint numThreadExecuted         = myMaterialData.numThreadExecuted;
+	uint idx                             = gl_WorkGroupID.x * NUM_WORKGROUP_Y_DIMENSION * THREAD_PER_LOCAL_WORKGROUP + gl_WorkGroupID.y * THREAD_PER_LOCAL_WORKGROUP + gl_LocalInvocationIndex;
+
+	if(idx >= numThreadExecuted)
+	{
+		return;
+	}
+
+	uint numTileToProcess      = myMaterialData.numThreadExecuted / (NUMBER_VOXEL_FACE * THREAD_PER_LOCAL_WORKGROUP);
+	uint indexToProcess        = uint(modulo(double(gl_WorkGroupID.x), double(numTileToProcess))); 
+	uint voxelFace             = uint(gl_WorkGroupID.y);
+	g_voxelSizeInt             = int(myMaterialData.voxelizationSize);
+	g_voxelSizeFloat           = float(g_voxelSizeInt);
+	ivec3 voxelMaxCoordinates  = ivec3(g_voxelSizeInt - 1);
+
+	// value 0 means x axis
+	// value 1 means y axis
+	// value 2 means z axis
+	//uint currentAxis           = (int(myPushConstant.pushConstantFilterCurrentAxis.x));
+
+	// First step: Load irradiance in the corresponding positions in s_irradianceInfo
+	s_tileIndex                = irradianceFilteringTagTilesIndex[indexToProcess]; // TODO: Put barrier here and share with other threads by loading from thread 0
+	ivec3 tileCoordinatesStart = unhashTileValue(s_tileIndex);
+	ivec3 voxelCoordinates     = tileCoordinatesStart * ivec3(TILE_SIDE);
+
+
+	//record  = ((tileCoordinatesStart == ivec3(23, 31, 42)) && (voxelFace == 4) && (currentAxis == 0));
+	record = false;
+	counter = gl_LocalInvocationIndex * 500;
+
+	// Initialise s_tileVoxelIsOccupied for all voxels in the tile and neighbours, represented in s_tileVoxelIsOccupied
+	ivec3 coordTemp;
+	for(uint i = 0; i < TILE_SIZE_TOTAL; ++i)
+	{
+		coordTemp                                                    = unhashValue(8 * gl_LocalInvocationIndex + i, TILE_SIDE + 2);
+		s_tileVoxelIsOccupied[coordTemp.x][coordTemp.y][coordTemp.z] = false;
+	}
+
+	// Initialise s_irradianceInfo and s_tileVoxelIsOccupied for all voxels in the tile and neighbours which are occupied
+	for(uint i = 0; i < TILE_SIZE_TOTAL; ++i)
+	{
+		ivec3 storeCoordinates = unhashValue(8 * gl_LocalInvocationIndex + i, TILE_SIDE + 2);
+		ivec3 loadCoordinates  = voxelCoordinates - ivec3(1) + storeCoordinates;
+
+		if(isVoxelOccupied(getHashedIndex(loadCoordinates)))
+		{
+			s_irradianceInfo[storeCoordinates.x][storeCoordinates.y][storeCoordinates.z]      = loadIrradiance(loadCoordinates, voxelFace);
+			s_tileVoxelIsOccupied[storeCoordinates.x][storeCoordinates.y][storeCoordinates.z] = true;
+		}
+	}
+
+	barrier();
+
+	// For each voxel in the tile, add irradiance from those neighbours which are occupied
+	ivec3 offset                   = arrayTileNeighbourCoordinates[gl_LocalInvocationIndex];
+	ivec3 loadCoordinates          = offset + ivec3(1);
+	float sigma                    = 25.0;
+	float gaussianValueAccumulated = 0.0;
+
+	float gaussianDistributionStoreValues[TILE_SIDE + 2][TILE_SIDE + 2][TILE_SIDE + 2];
+
+	int arrayFinalIndices[27];
+	int numArrayFinalIndices = 0;
+
+	if(s_tileVoxelIsOccupied[loadCoordinates.x][loadCoordinates.y][loadCoordinates.z])
+	{
+		for(int i = 0; i < 27; ++i)
+		{
+			ivec3 filterLoadCoordinates = loadCoordinates + arrayNeighbourCoordinates[i];
+
+			if((s_tileVoxelIsOccupied[filterLoadCoordinates.x][filterLoadCoordinates.y][filterLoadCoordinates.z]) && 
+			   (dot(vec3(1.0), s_irradianceInfo[filterLoadCoordinates.x][filterLoadCoordinates.y][filterLoadCoordinates.z]) > 0.0))
+			{
+				gaussianValueAccumulated                += precomputedGaussianWeight[i];
+				arrayFinalIndices[numArrayFinalIndices]  = i;
+				numArrayFinalIndices++;
+			}
+		}
+
+		vec3 irradianceFinal = vec3(0.0);
+
+		for(int i = 0; i < numArrayFinalIndices; ++i)
+		{
+			ivec3 filterLoadCoordinates = loadCoordinates + arrayNeighbourCoordinates[arrayFinalIndices[i]];
+			float kernelNormalisedValue = precomputedGaussianWeight[i] / gaussianValueAccumulated;
+			irradianceFinal            += s_irradianceInfo[filterLoadCoordinates.x][filterLoadCoordinates.y][filterLoadCoordinates.z] * kernelNormalisedValue;
+		}
+
+		// Avoid writing when the value is 0
+		if(dot(irradianceFinal, vec3(1.0)) > 0.0)
+		{
+			storeIrradiance(irradianceFinal.xyz, voxelFace, voxelCoordinates + offset);
+		}
+	}
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

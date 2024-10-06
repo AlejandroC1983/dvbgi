@@ -1,0 +1,394 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#extension GL_EXT_shader_8bit_storage : enable
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+  // WARNING 4 32-bit ALLIGNMENT
+  uint localWorkGroupsXDimension; //!< Dispatch command x dimension size
+  uint localWorkGroupsYDimension; //!< Dispatch command y dimension size
+  uint numThreadExecuted;         //!< Number of total thread executed
+  uint voxelizationSize;          //!< Size of the voxelization texture
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 1) buffer coherent voxelOccupiedBuffer
+{
+   uint voxelOccupied[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to store all the dynamically generated voxels that are visible from camera, this buffer has
+* size DynamicVoxelCopyToBufferTechnique::m_maxDynamicVoxel */
+layout (binding = 2) buffer coherent cameraVisibleDynamicVoxelBuffer
+{
+    uint cameraVisibleDynamicVoxel[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 3) buffer coherent voxelOccupiedDynamicBuffer
+{
+    uint voxelOccupiedDynamic[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to store the irradiance per voxel face of each of the camera dynamic visible voxels */
+layout (binding = 4) buffer coherent cameraVisibleDynamicVoxelIrradianceBuffer
+{
+    float cameraVisibleDynamicVoxelIrradiance[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for debug purposes */
+layout (binding = 5) buffer coherent voxel2dFilterDebugBuffer
+{
+    float voxel2dFilterDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer of camera visible test dynamic voxels having information on a per-byte approach (each byte of the buffer has information whether a 
+* dynamic voxel is vislbe from camera or not, representing each byte's index in the buffer the hashed index of a voxel's coordinates) */
+layout (binding = 6) buffer coherent cameraVisibleDynamicVoxelPerByteBuffer
+{
+    uint8_t cameraVisibleDynamicVoxelPerByte[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer which will be used in ProcessCameraVisibleResultsTechnique to take all the occupied voxels from cameraVisibleDynamicVoxelPerByteBuffer 
+* and set those and their neighbouring voxels for processing */
+layout (binding = 7) buffer coherent cameraVisibleDynamicVoxelPerByteTagProcessBuffer
+{
+    uint8_t cameraVisibleDynamicVoxelPerByteTagProcess[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// Image load / store
+layout(binding = 8,  r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DDynamicNegativeX;
+layout(binding = 9,  r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DDynamicPositiveX;
+layout(binding = 10, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DDynamicNegativeY;
+layout(binding = 11, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DDynamicPositiveY;
+layout(binding = 12, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DDynamicNegativeZ;
+layout(binding = 13, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DDynamicPositiveZ;
+
+// DEFINES
+#define PI                                       3.14159265359
+#define KERNEL_SIZE                              3
+#define NUMBER_VOXEL_FACE                        6
+#define NUMBER_IRRADIANCE_FIELDS_PER_VOXEL_FACE  3
+#define NUMBER_VOXEL_TO_SAMPLE                  25
+#define NUMBER_VOXEL_FACE_LOAD_OFFSET            3
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+int   g_voxelSizeInt;            //!< Size of the voxelization texture
+float g_voxelSizeFloat;          //!< Size of the voxelization texture
+vec3  g_voxelIrradiance[KERNEL_SIZE + 2][KERNEL_SIZE + 2];     // Irradiance of the voxel and its neighbours to be used for the filtering
+
+bool record;
+uint counter;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array with the 3D offsets to load irradiance from the 3D irradiance textures based on the voxel face axis index */
+ivec3 arrayVoxelFaceLoadOffset3D[NUMBER_VOXEL_FACE_LOAD_OFFSET][NUMBER_VOXEL_TO_SAMPLE] = 
+{
+    {ivec3( 0, -2, -2), ivec3( 0, -2, -1), ivec3( 0, -2,  0), ivec3( 0, -2,  1), ivec3(0, -2,  2),
+     ivec3( 0, -1, -2), ivec3( 0, -1, -1), ivec3( 0, -1,  0), ivec3( 0, -1,  1), ivec3(0, -1,  2),
+     ivec3( 0,  0, -2), ivec3( 0,  0, -1), ivec3( 0,  0,  0), ivec3( 0,  0,  1), ivec3(0,  0,  2),
+     ivec3( 0,  1, -2), ivec3( 0,  1, -1), ivec3( 0,  1,  0), ivec3( 0,  1,  1), ivec3(0,  1,  2),
+     ivec3( 0,  2, -2), ivec3( 0,  2, -1), ivec3( 0,  2,  0), ivec3( 0,  2,  1), ivec3(0,  2,  2)}, // negative x and positive x
+     
+    {ivec3(-2,  0, -2), ivec3(-2,  0, -1), ivec3(-2,  0,  0), ivec3(-2,  0,  1), ivec3(0, -2,  2),
+     ivec3(-1,  0, -2), ivec3(-1,  0, -1), ivec3(-1,  0,  0), ivec3(-1,  0,  1), ivec3(0, -1,  2),
+     ivec3( 0,  0, -2), ivec3( 0,  0, -1), ivec3( 0,  0,  0), ivec3( 0,  0,  1), ivec3(0,  0,  2),
+     ivec3( 1,  0, -2), ivec3( 1,  0, -1), ivec3( 1,  0,  0), ivec3( 1,  0,  1), ivec3(0,  1,  2),
+     ivec3( 2,  0, -2), ivec3( 2,  0, -1), ivec3( 2,  0,  0), ivec3( 2,  0,  1), ivec3(0,  2,  2)}, // negative y and positive y
+      
+    {ivec3(-2, -2, 0),  ivec3(-2, -1,  0), ivec3(-2,  0,  0), ivec3(-2,  1,  0), ivec3(-2, 2,  0),
+     ivec3(-1, -2, 0),  ivec3(-1, -1,  0), ivec3(-1,  0,  0), ivec3(-1,  1,  0), ivec3(-1, 2,  0),
+     ivec3( 0, -2, 0),  ivec3( 0, -1,  0), ivec3( 0,  0,  0), ivec3( 0,  1,  0), ivec3( 0, 2,  0),
+     ivec3( 1, -2, 0),  ivec3( 1, -1,  0), ivec3( 1,  0,  0), ivec3( 1,  1,  0), ivec3( 1, 2,  0),
+     ivec3( 2, -2, 0),  ivec3( 2, -1,  0), ivec3( 2,  0,  0), ivec3( 2,  1,  0), ivec3( 2, 2,  0)} // negative z and positive z
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array with the 2D offsets to store in temporal variable irradiance from the 3D irradiance textures based on the voxel 
+* face axis index, since the filtering is done in 2D only a single set of offsets is needed, matching at each index the values for the corresponding 3D load offset from arrayVoxelFaceLoadOffset3D */
+ivec2 arrayVoxelFaceStoreOffset2D[NUMBER_VOXEL_TO_SAMPLE] = 
+{
+    ivec2(0, 0), ivec2(0, 1), ivec2(0, 2), ivec2(0, 3), ivec2(0, 4),
+    ivec2(1, 0), ivec2(1, 1), ivec2(1, 2), ivec2(1, 3), ivec2(1, 4),
+    ivec2(2, 0), ivec2(2, 1), ivec2(2, 2), ivec2(2, 3), ivec2(2, 4),
+    ivec2(3, 0), ivec2(3, 1), ivec2(3, 2), ivec2(3, 3), ivec2(3, 4),
+    ivec2(4, 0), ivec2(4, 1), ivec2(4, 2), ivec2(4, 3), ivec2(4, 4)
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array with the 2D offsets to sample g_voxelIrradiance when computing Gaussian filter values with a 3x3 kernel */
+ivec2 arrayFilteringOffset2D[KERNEL_SIZE][KERNEL_SIZE] = 
+{
+    {ivec2( 1,  1), ivec2( 1, 2), ivec2( 1, 3)},
+    {ivec2( 2,  1), ivec2( 2, 2), ivec2( 2, 3)},
+    {ivec2( 3,  1), ivec2( 3, 2), ivec2( 3, 3)},
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array with precomputed values for the Gaussian distribution used for the Gaussian filtering operations, 
+* using sigma value 25.0, for (x,y) in {-1, 0, 1} x {-1, 0, 1}: The function gaussianDistribution was used to compute the values */
+
+float arrayGaussianPrecomputed[KERNEL_SIZE][KERNEL_SIZE] = 
+{
+    {0.000254240818, 0.000254444283, 0.000254240818},
+    {0.000254444283, 0.000254647923, 0.000254444283},
+    {0.000254240818, 0.000254444283, 0.000254240818},
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** hashed value for texture coordinates given as parameter in a voxelization of size given as parameter
+* @param texcoord  [in] texture coordinates
+* @param voxelSize [in] voxelization size
+* @return hashed value */
+int getHashedIndex(ivec3 texcoord)
+{
+    return texcoord.x * g_voxelSizeInt * g_voxelSizeInt + texcoord.y * g_voxelSizeInt + texcoord.z;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupied if the current voxel is occupied by at least one fragment, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupied(uint indexHashed)
+{
+    float integerPart;
+    float indexDecimalFloat = float(indexHashed) / 32.0;
+    float fractional        = modf(indexDecimalFloat, integerPart);
+    uint index              = uint(integerPart);
+    uint bit                = uint(fractional * 32.0);
+    bool result             = ((voxelOccupied[index] & (1 << bit)) > 0);
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupiedDynamic if the current voxel is occupied by one voxel, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupiedDynamic(uint indexHashed)
+{
+    float integerPart;
+    float indexDecimalFloat = float(indexHashed) / 32.0;
+    float fractional        = modf(indexDecimalFloat, integerPart);
+    uint index              = uint(integerPart);
+    uint bit                = uint(fractional * 32.0);
+    bool result             = ((voxelOccupiedDynamic[index] & (1 << bit)) > 0);
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+ivec3 unhashValue(uint value)
+{
+  float number     = float(value) / g_voxelSizeFloat;
+
+  ivec3 result;
+  float integerPart;
+  float fractional = modf(number, integerPart);
+  result.z         = int(fractional * g_voxelSizeFloat);
+  number          /= g_voxelSizeFloat;
+  fractional       = modf(number, integerPart);
+  result.y         = int(fractional * g_voxelSizeFloat);
+  result.x         = int(integerPart);
+
+  return result;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Gaussian distribution for x and y parameters, for sigma given also by parameter
+* @param x     [in] x value to compute Gaussian distribution
+* @param y     [in] y value to compute Gaussian distribution
+* @param sigma [in] sigma value to compute Gaussian distribution
+* @return Gaussian distribution value */
+// TODO: Precompute
+float gaussianDistribution(float x, float y, float sigma)
+{
+    float denominator    = 2.0 * PI * sigma * sigma;
+    float expNumerator   = x * x + y * y;
+    float expDenominator = 2.0 * sigma * sigma;
+
+    return (1.0 / denominator) * exp(-1.0 * (expNumerator / expDenominator));
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Does the integer modulo operation x mod(y) returning the interger result
+* @param x [in] value to apply module to
+* @param y [in] value to apply module with
+* @return retul of the operation x mod(y) */
+double modulo(double x, double y)
+{
+    return x - (y * floor(x / y));
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Load irradiance information from the coordinates and voxel face given from the corresponding texture for dynamic voxels
+* @param faceIndex   [in] face index for the texture where to load irradiance information from
+* @param coordinates [in] texture coordinates where to load the irradiance
+* @param irradiance  [in] irradiance value to load
+* @return irradiance value loaded */
+vec3 loadDynamicIrradianceInformation(int faceIndex, ivec3 coordinates)
+{
+    switch (faceIndex)
+    {
+        case 0:
+        {
+            return imageLoad(irradiance3DDynamicNegativeX, coordinates).xyz;
+        }
+        case 1:
+        {
+            return imageLoad(irradiance3DDynamicPositiveX, coordinates).xyz;
+            break;
+        }
+        case 2:
+        {
+            return imageLoad(irradiance3DDynamicNegativeY, coordinates).xyz;
+            break;
+        }
+        case 3:
+        {
+            return imageLoad(irradiance3DDynamicPositiveY, coordinates).xyz;
+            break;
+        }
+        case 4:
+        {
+            return imageLoad(irradiance3DDynamicNegativeZ, coordinates).xyz;
+            break;
+        }
+        case 5:
+        {
+            return imageLoad(irradiance3DDynamicPositiveZ, coordinates).xyz;
+            break;
+        }
+    };
+
+    return vec3(0.0);
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Test whether the voxel with hashed index gien as parameter has been classified as visible in the cameraVisibleDynamicVoxelPerByte buffer
+* @param indexHashed [in] index of the dynamic voxel to test
+* @return true if set as visible, false otherwise */
+bool isDynamicVoxelVisible(uint indexHashed)
+{
+    return (uint(cameraVisibleDynamicVoxelPerByteTagProcess[indexHashed]) > 0);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Compute Gaussian filtering with a kernel of size 3x3 with the information present at g_voxelIrradiance using as 
+* base coordinates the ones given by the centerCoordinates coordinates (in the range [1,3]x[1,3])
+* @param centerCoordinates [in] base coordinates for the computations
+* @return Gaussian filtering result */
+vec3 gaussianFiltering3x3(ivec2 centerCoordinates)
+{
+    ivec2 samplingCoordinates;
+
+    // First pass to know the added up value of the gaussian filter values
+
+    int x;
+    int y;
+    float sum = 0.0; // used for normalization, one sum value for each rgb channel
+
+    for (x = 0; x < 3; ++x)
+    {
+        for (y = 0; y < 3; ++y)
+        {
+            samplingCoordinates = ivec2(x, y) + centerCoordinates - ivec2(1, 1);
+
+            if(dot(g_voxelIrradiance[samplingCoordinates.x][samplingCoordinates.y], vec3(1.0)) > 0.0)
+            {
+                sum += arrayGaussianPrecomputed[x][y];
+            }
+        }
+    }
+
+    if(sum == 0.0)
+    {
+        sum = 1.0;
+    }
+
+    // Second pass for the actual value
+
+    float kernelNormalizedValue;
+    vec3 filteredIrradiance         = vec3(0.0);
+    int numIrradiancePositive       = 0;
+    ivec2 lastCoordinatesIrradiance = ivec2(-1);
+
+    for (x = 0; x < 3; ++x)
+    {
+        for (y = 0; y < 3; ++y)
+        {
+            samplingCoordinates = ivec2(x, y) + centerCoordinates - ivec2(1, 1);
+
+            if(dot(g_voxelIrradiance[samplingCoordinates.x][samplingCoordinates.y], vec3(1.0)) > 0.0)
+            {
+                kernelNormalizedValue     = arrayGaussianPrecomputed[x][y] / sum;
+                filteredIrradiance       += g_voxelIrradiance[samplingCoordinates.x][samplingCoordinates.y] * kernelNormalizedValue;
+                lastCoordinatesIrradiance = samplingCoordinates;
+                numIrradiancePositive++;
+            }
+        }
+    }
+
+    if ((numIrradiancePositive == 1) && (lastCoordinatesIrradiance == ivec2(2, 2)))
+    {
+        // Do not take into account cases where all neighbours of the voxel being analysed, at coordinates (2, 2) have 
+        // irradiance value 0, trying to favour those voxels with a low irradiance
+        return vec3(0.0);
+    }
+
+    return filteredIrradiance;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

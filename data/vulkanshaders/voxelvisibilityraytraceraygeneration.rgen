@@ -1,0 +1,726 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_scalar_block_layout : enable
+
+layout (std140, binding = 0) uniform sceneCamera
+{
+    mat4 view;
+    mat4 projection;
+    vec4 sceneOffset;
+    vec4 sceneExtent;
+} mySceneCamera;
+
+layout (std140, binding = 1) uniform materialData
+{
+    // WARNING 4 32-bit ALLIGNMENT
+    vec4 sceneMinAndNumberVoxel;  //!< Scene min and number voxel in w field
+    vec4 sceneExtentAndVoxelSize; //!< Extent of the scene in the xyz coordinates, voxelization texture size in the w coordinate
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the hashed position of the 3D volume voxelization coordinates the fragment
+* data in the same index at the voxelFirstIndexCompactedBuffer buffer
+* occupied initially in the non-compacted buffer */
+layout (binding = 2) buffer coherent voxelHashedPositionCompactedBuffer
+{
+    uint voxelHashedPositionCompacted[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for accelerating the search of elements in voxelFirstIndexCompactedBuffer and
+* voxelHashedPositionCompactedBuffer. Contains the index to the first element in
+* voxelFirstIndexCompactedBuffer and voxelHashedPositionCompactedBuffer for fixed
+* 3D voxelization values, like (0,0,0), (0,0,128), (0,1,0), (0,1,128), (0,2,0), (0,2,128), ... */
+layout (binding = 3) buffer coherent IndirectionIndexBuffer
+{
+    uint IndirectionIndex[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for accelerating the search of elements in voxelFirstIndexCompactedBuffer and
+* voxelHashedPositionCompactedBuffer. Contains the amount of elements at the same index in
+* IndirectionIndexBuffer, to know how many elements to the right are there when using the
+* value at the same index of IndirectionIndexBuffe in voxelFirstIndexCompactedBuffer */
+layout (binding = 4) buffer coherent IndirectionRankBuffer
+{
+    uint IndirectionRank[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer where for each voxel the visibility of static voxels is cached. The information
+*  stored in each 32-bit uint is the distance from the voxel to the visible voxel (if any)
+* in 16 bits and the hit normal in the other 16 bits encoded as 7 bits for x and y components 
+* and 1 bit for the z component's sign */
+layout (binding = 5) buffer coherent voxelVisibility4BytesBuffer
+{
+    uint voxelVisibility4Bytes[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used for debugging purposes */
+layout (binding = 6) buffer coherent voxelVisibilityDebugBuffer
+{
+    double voxelVisibilityDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 7) buffer coherent voxelOccupiedBuffer
+{
+   uint voxelOccupied[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Pointer to buffer with the per voxel face directions (128) to rebuilf the position of the ray intersected */
+layout (binding = 8) buffer coherent rayDirectionBuffer
+{
+    vec4 rayDirection[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout(binding = 9)  uniform  accelerationStructureEXT staticraytracedaccelerationstructure;
+layout(binding = 10,  rgba16f) uniform image2D raytracingoffscreen;
+layout(binding = 11) uniform usampler3D staticVoxelIndexTexture;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+struct hitPayload
+{
+    vec3 hitPosition;
+    vec3 hitNormal;
+    float distance;
+    vec3 v0;
+    vec3 v1;
+    vec3 v2;
+    vec3 barycentrics;
+    vec3 worldPos;
+};
+
+layout(location = 0) rayPayloadEXT hitPayload prd;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// DEFINES
+#define NUMBER_DIRECTION     6
+#define NUMBER_DESIRED_POINT 128
+
+float g_voxelSize;    //!< Size of the voxelization texture
+int   g_voxelSizeInt; //!< Size of the voxelization texture
+vec3  g_sceneExtent;  //!< Scene extent
+vec3  g_sceneMin;     //!< Scene AABB min value
+vec3 g_voxelWorldHalfDiagonal;
+vec3 g_voxelWorldCoordinates;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** One of the precomputed directions to compare with the normal direction of the fragment, to ray
+* march on voxel space in the search of lit voxels
+* Three 15 elements per dirfection */
+vec3 arrayVoxelRayDirection[NUMBER_DIRECTION] =
+{
+    vec3( 0.0f,  0.0f, -1.0f), // Negative x
+    vec3( 0.0f,  0.0f,  1.0f), // Positive x
+    vec3( 0.0f, -1.0f,  0.0f), // Negative y
+    vec3( 0.0f,  1.0f,  0.0f), // Positive y
+    vec3(-1.0f,  0.0f,  0.0f), // Negative z
+    vec3( 1.0f,  0.0f,  0.0f)  // Positive z
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Given a normalized direction by the direction parameter, return the index in
+* arrayVoxelRayDirection of the closest direction
+* @param direction [in] direction to test
+* @return index in arrayVoxelRayDirection of the closest direction */
+int getClosestDirectionIndex(vec3 direction)
+{
+    int indexClosest   = -1;
+    float minimumAngle = -1.0;
+    float minimumAngleTemp;
+
+    for(int i = 0; i < NUMBER_DIRECTION; ++i)
+    {
+        minimumAngleTemp = dot(arrayVoxelRayDirection[i], direction);
+
+        if(minimumAngleTemp > minimumAngle)
+        {
+            minimumAngle = minimumAngleTemp;
+            indexClosest = i;
+        }
+    }
+
+    return indexClosest;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Maps the voxel face index (-x, +x, -y, +y, -z, +z) to the one to use for ray tracing (-z,+z,-y,+y,-x,+x)
+* @param voxelFace [in] voxel face index
+* @return index to get a direction from when building the ray tracing direciton to cast a ray */
+int mapVoxelFaceIndex(int voxelFace)
+{
+    switch(voxelFace)
+    {
+        case 0:
+        {
+            return 4;
+        }
+        case 1:
+        {
+            return 5;
+        }
+        case 2:
+        {
+            return 2;
+        }
+        case 3:
+        {
+            return 3;
+        }
+        case 4:
+        {
+            return 0;
+        }
+        case 5:
+        {
+            return 1;
+        }
+        default:
+        {
+            return -1;
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+vec3 arrayDirections[6] = {
+    vec3(-1.0,  0.0,  0.0),
+    vec3( 1.0,  0.0,  0.0),
+    vec3( 0.0, -1.0,  0.0),
+    vec3( 0.0,  1.0,  0.0),
+    vec3( 0.0,  0.0, -1.0),
+    vec3( 0.0,  0.0,  1.0)
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+ivec3 unhashValue(uint value)
+{
+    float number     = float(value) / g_voxelSize;
+
+    ivec3 result;
+    float integerPart;
+    float fractional = modf(number, integerPart);
+    result.z         = int(fractional * g_voxelSize);
+    number          /= g_voxelSize;
+    fractional       = modf(number, integerPart);
+    result.y         = int(fractional * g_voxelSize);
+    result.x         = int(integerPart);
+
+    return result;
+}
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes world space coordinates for 3D texture coordinates
+* @param coordinates [in] texture coordinates
+* @return world coordinates of the voxel coordinates given as parameter */
+vec3 voxelSpaceToWorld(ivec3 coordinates)
+{
+    vec3 result = vec3(float(coordinates.x), float(coordinates.y), float(coordinates.z));
+    result     /= vec3(g_voxelSize);
+    result     *= g_sceneExtent;
+    result     += g_sceneMin;
+    result     += (g_sceneExtent / g_voxelSize) * 0.5;
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Search in voxelHashedPositionCompactedBuffer for the index of the hashed value
+* of the texcoord parameter.
+* @param texcoord       [in] 3D texture coordinates to find index for
+* @param hashedPosition [in] texcoord parameter hashed texture coordinates
+* @return uvec2 with index in .x field and test result in .y field */
+uvec2 findHashedCompactedPositionIndex(uvec3 texcoord, uint hashedPosition)
+{
+	// TODO: Sample texture through texelFetch
+    // TODO: Initialise staticVoxelIndexTexture with maxValue value
+    uint index = texelFetch(staticVoxelIndexTexture, ivec3(texcoord), 0).r;
+
+    if(index != 4294967295)
+    {
+        return uvec2(index, 1);
+    }
+
+    return uvec2(0, 0);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** hashed value for texture coordinates given as parameter in a voxelization of size given as parameter
+* @param texcoord  [in] texture coordinates
+* @param voxelSize [in] voxelization size
+* @return hashed value */
+int getHashedIndex(ivec3 texcoord)
+{
+    return texcoord.x * g_voxelSizeInt * g_voxelSizeInt + texcoord.y * g_voxelSizeInt + texcoord.z;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes texture space coordinates of the world coordinates given as parameter
+* @param worldCoordinates [in] world coordinates
+* @return texture space coordinates of the world coordinates given as parameter */
+ivec3 worldToVoxelSpaceInteger(vec3 worldCoordinates)
+{
+    vec3 result = worldCoordinates;
+    result     -= g_sceneMin;
+    result     /= g_sceneExtent;
+    result     *= vec3(g_voxelSize);
+
+    return ivec3(int(result.x), int(result.y), int(result.z));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Encode 8-bit per channel RGBA value given as parameter in a single unsigned it
+* @param value [in] value to encode
+* @return unsigned int with encoded values */
+uint convVec4ToRGBA8(vec4 val)
+{
+    return (uint(val.w)&0x000000FF)<<24U | (uint(val.z)&0x000000FF) <<16U | (uint(val.y)&0x000000FF)<<8U | (uint(val.x)&0x000000FF);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Does the integer modulo operation x mod(y) returning the interger result
+* @param x [in] value to apply module to
+* @param y [in] value to apply module with
+* @return retul of the operation x mod(y) */
+float modulo(float x, float y)
+{
+    return x - (y * floor(x / y));
+}
+
+////////////////////////////////////////////////////////////////////////////////////
+
+/** Encode a normal with information in the first 16 bits of a 32-bit uint
+* with bits 0-6 for the x component, bit 7-13 for the y component, and bit 14 for the
+* z component sign (value 0 means negative, value 1, positive)
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __
+* 15 14 13 12 11 10  9  8  7  6  5  4  3  2  1  0
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __
+*    |s||   y component     ||   x component    |
+* __ __ __ __ __ __ __ __ __ __ __ __ __ __ __ __
+* @param normal [in] normal direction to encode
+* @return compressed normal direction */
+uint encodeNormalXYFloatToUInt7Bit(vec3 normal)
+{
+    vec2 resultFloat = vec2(normal.x * 0.5 + 0.5, normal.y * 0.5 + 0.5);
+    resultFloat     *= 127.0;
+    resultFloat.x    = clamp(resultFloat.x, 0.0, 127.0);
+    resultFloat.y    = clamp(resultFloat.y, 0.0, 127.0);
+    uint xValue      = uint(resultFloat.x);
+    uint yValue      = uint(resultFloat.y);
+
+    uint result      = xValue | (yValue << 7);
+    if (normal.z > 0.0)
+    {
+        result |= 0x00004000;
+    }
+
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Encode in a 4 bytes uint the distance value (from the voxel center to the hit position) as a 16 bit 
+* float (in the bits 16-31) and a 7 bit integer approximation of the x and y normal direction components 
+* in the bits 0-15 
+* @param distanceValue [in] distance value to encode
+* @param hitNormal     [in] normal direction to encode
+* @return encoded values */
+uint encodeHitInformation(float distanceValue, vec3 hitNormal)
+{
+    uint normalData   = encodeNormalXYFloatToUInt7Bit(hitNormal);
+    uint distanceData = packHalf2x16(vec2(0.0f, distanceValue));
+    return distanceData | normalData;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupied if the current voxel is occupied by at least one fragment, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupied(uint indexHashed)
+{
+    float integerPart;
+    float indexDecimalFloat = float(indexHashed) / 32.0;
+    float fractional        = modf(indexDecimalFloat, integerPart);
+    uint index              = uint(integerPart);
+    uint bit                = uint(fractional * 32.0);
+    bool result             = ((voxelOccupied[index] & (1 << bit)) > 0);
+    return result;
+}
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+void main()
+{
+    int voxelIndex                  = int(gl_LaunchIDEXT.x);
+    int rayIndex                    = int(gl_LaunchIDEXT.y);
+    int rayFace                     = int(gl_LaunchIDEXT.z);
+    g_voxelSize                     = myMaterialData.sceneExtentAndVoxelSize.w;
+    g_voxelSizeInt                  = int(g_voxelSize);
+    g_sceneExtent                   = myMaterialData.sceneExtentAndVoxelSize.xyz;
+    g_sceneMin                      = myMaterialData.sceneMinAndNumberVoxel.xyz;
+    g_voxelWorldHalfDiagonal        = (g_sceneExtent / g_voxelSize) * 0.5;
+    uint g_textVoxelHashedPosition  = voxelHashedPositionCompacted[voxelIndex];
+    ivec3 g_voxelTextureCoordinates = unhashValue(g_textVoxelHashedPosition);
+    g_voxelWorldCoordinates         = voxelSpaceToWorld(g_voxelTextureCoordinates);
+    int faceSamplingDirection       = rayFace;
+    vec3 endPoint                   = rayDirection[faceSamplingDirection * 128 + rayIndex].xyz;
+    vec3 rayDirectionValue          = normalize(endPoint);
+    vec3 mainDirection              = arrayDirections[faceSamplingDirection];
+    vec3 rayOrigin                  = g_voxelWorldCoordinates + mainDirection * g_voxelWorldHalfDiagonal; // IMPORTANT: CHANGES HERE AFFECT LIGHTBOUNCE WHEN THE HIT POSITIONIS RECONSTRUCTED
+    uint rayFlags                   = gl_RayFlagsOpaqueEXT;
+    float tMin                      = length(g_voxelWorldHalfDiagonal) * (DYNAMIC_VOXEL_RT_TMIN_MULTIPLIER / 100.0);
+    float tMax                      = 10000.0;
+    prd.hitPosition                 = vec3(0.0);
+    prd.hitNormal                   = vec3(0.0);
+    prd.distance                    = -1.0;
+
+    traceRayEXT(staticraytracedaccelerationstructure, // acceleration structure
+                rayFlags,                       // rayFlags
+                0xFF,                           // cullMask
+                0,                              // sbtRecordOffset
+                0,                              // sbtRecordStride
+                0,                              // missIndex
+                rayOrigin,                      // ray origin
+                tMin,                           // ray min range
+                rayDirectionValue,              // ray direction
+                tMax,                           // ray max range
+                0                               // payload (location = 0)
+    );
+
+    bool record = false;
+    //bool record = ((g_voxelTextureCoordinates == ivec3(72, 52, 72)) && (rayFace == 1));
+    int counter = rayIndex * 250;
+
+    if(record)
+    {
+        voxelVisibilityDebug[counter++] = double(1111.0);
+        voxelVisibilityDebug[counter++] = double(voxelIndex);
+        voxelVisibilityDebug[counter++] = double(rayIndex);
+        voxelVisibilityDebug[counter++] = double(rayFace);
+        voxelVisibilityDebug[counter++] = double(2222.0);
+        voxelVisibilityDebug[counter++] = double(g_voxelTextureCoordinates.x);
+        voxelVisibilityDebug[counter++] = double(g_voxelTextureCoordinates.y);
+        voxelVisibilityDebug[counter++] = double(g_voxelTextureCoordinates.z);
+        voxelVisibilityDebug[counter++] = double(3333.0);
+        voxelVisibilityDebug[counter++] = double(g_voxelWorldCoordinates.x);
+        voxelVisibilityDebug[counter++] = double(g_voxelWorldCoordinates.y);
+        voxelVisibilityDebug[counter++] = double(g_voxelWorldCoordinates.z);
+        voxelVisibilityDebug[counter++] = double(4444.0);
+        voxelVisibilityDebug[counter++] = double(rayDirectionValue.x);
+        voxelVisibilityDebug[counter++] = double(rayDirectionValue.y);
+        voxelVisibilityDebug[counter++] = double(rayDirectionValue.z);
+        voxelVisibilityDebug[counter++] = double(5555.0);
+        voxelVisibilityDebug[counter++] = double(mainDirection.x);
+        voxelVisibilityDebug[counter++] = double(mainDirection.y);
+        voxelVisibilityDebug[counter++] = double(mainDirection.z);
+        voxelVisibilityDebug[counter++] = double(7710.0);
+        voxelVisibilityDebug[counter++] = double(rayOrigin.x);
+        voxelVisibilityDebug[counter++] = double(rayOrigin.y);
+        voxelVisibilityDebug[counter++] = double(rayOrigin.z);
+        voxelVisibilityDebug[counter++] = double(7720.0);
+        ivec3 rayOriginTemp = worldToVoxelSpaceInteger(rayOrigin);
+        voxelVisibilityDebug[counter++] = double(rayOriginTemp.x);
+        voxelVisibilityDebug[counter++] = double(rayOriginTemp.y);
+        voxelVisibilityDebug[counter++] = double(rayOriginTemp.z);
+        voxelVisibilityDebug[counter++] = double(7725.0);
+    }
+
+    ivec3 originalOccupiedVoxelCoordinates = worldToVoxelSpaceInteger(prd.hitPosition);
+
+
+    if(record)
+    {    
+        voxelVisibilityDebug[counter++] = double(7730.0);
+        voxelVisibilityDebug[counter++] = double(prd.hitNormal.x);
+        voxelVisibilityDebug[counter++] = double(prd.hitNormal.y);
+        voxelVisibilityDebug[counter++] = double(prd.hitNormal.z);
+        voxelVisibilityDebug[counter++] = double(7740.0);
+        voxelVisibilityDebug[counter++] = double(prd.hitPosition.x);
+        voxelVisibilityDebug[counter++] = double(prd.hitPosition.y);
+        voxelVisibilityDebug[counter++] = double(prd.hitPosition.z);
+        voxelVisibilityDebug[counter++] = double(7750.0);
+        voxelVisibilityDebug[counter++] = double(originalOccupiedVoxelCoordinates.x);
+        voxelVisibilityDebug[counter++] = double(originalOccupiedVoxelCoordinates.y);
+        voxelVisibilityDebug[counter++] = double(originalOccupiedVoxelCoordinates.z);
+        voxelVisibilityDebug[counter++] = double(7760.0);
+        vec3 v0v1 = prd.v1 - prd.v0;
+        vec3 v0v2 = prd.v2 - prd.v0;
+        double triangleArea = length(cross(v0v1, v0v2)) * 0.5;
+        voxelVisibilityDebug[counter++] = double(triangleArea);
+        voxelVisibilityDebug[counter++] = double(7765.0);
+    }
+
+    if(prd.distance != -1)
+    {
+        // First see if the normal of the triangle intersected is too different from the ray direction
+        if(dot(-1.0 * rayDirectionValue, prd.hitNormal) < 0.0)
+        {
+            return;
+        }
+
+        vec3 originalNormal      = prd.hitNormal;
+        vec3 originalHitPosition = prd.hitPosition;
+
+        // TODO: Take into account only "big triangles" for the previous test?
+        // Trace an extra 3 rays, just for this case, to get a mean normal value (some rays hit geometry with a normal direction not representative of te goemtry they have around)
+        vec3 firstVector  = normalize(cross(-1.0 * rayDirectionValue, vec3(0.0, 1.0, 0.0))); // Generate a vector that is in the plane with cross product with (0,1,0).
+        vec3 secondVector = normalize(cross(firstVector, -1.0 * rayDirectionValue));
+
+        // Use a cone of angle 10 degrees to spread the samples according to distance
+        // Modelling the cone as a right angle triangle
+        float coneRadius = 2.0;
+
+        vec3 point0 = prd.hitPosition + firstVector  * g_voxelWorldHalfDiagonal * coneRadius;
+        vec3 point1 = prd.hitPosition - firstVector  * g_voxelWorldHalfDiagonal * coneRadius;
+        vec3 point2 = prd.hitPosition + secondVector * g_voxelWorldHalfDiagonal * coneRadius;
+        vec3 point3 = prd.hitPosition - secondVector * g_voxelWorldHalfDiagonal * coneRadius;
+
+        vec3 direction0 = normalize(point0 - rayOrigin);
+        vec3 direction1 = normalize(point1 - rayOrigin);
+        vec3 direction2 = normalize(point2 - rayOrigin);
+        vec3 direction3 = normalize(point3 - rayOrigin);
+
+        prd.hitPosition = vec3(0.0);
+        prd.hitNormal   = vec3(0.0);
+        prd.distance    = -1.0;
+        traceRayEXT(staticraytracedaccelerationstructure, // acceleration structure
+                    rayFlags,                       // rayFlags
+                    0xFF,                           // cullMask
+                    0,                              // sbtRecordOffset
+                    0,                              // sbtRecordStride
+                    0,                              // missIndex
+                    rayOrigin,                      // ray origin
+                    tMin,                           // ray min range
+                    direction0,                     // ray direction
+                    tMax,                           // ray max range
+                    0                               // payload (location = 0)
+        );
+        float numberNormal = 1.0;
+        if((prd.distance != -1) && (distance(originalHitPosition, prd.hitPosition) < 2.0))
+        {
+            originalNormal += prd.hitNormal;
+            numberNormal   += 1.0;
+            if(record)
+            {
+                voxelVisibilityDebug[counter++] = float(7765.0);
+            }
+        }
+
+        prd.hitPosition = vec3(0.0);
+        prd.hitNormal   = vec3(0.0);
+        prd.distance    = -1.0;
+        traceRayEXT(staticraytracedaccelerationstructure, // acceleration structure
+                    rayFlags,                       // rayFlags
+                    0xFF,                           // cullMask
+                    0,                              // sbtRecordOffset
+                    0,                              // sbtRecordStride
+                    0,                              // missIndex
+                    rayOrigin,                      // ray origin
+                    tMin,                           // ray min range
+                    direction1,                     // ray direction
+                    tMax,                           // ray max range
+                    0                               // payload (location = 0)
+        );
+        //if(prd.distance != -1)
+        if((prd.distance != -1) && (distance(originalHitPosition, prd.hitPosition) < 2.0))
+        {
+            originalNormal += prd.hitNormal;
+            numberNormal += 1.0;
+            if(record)
+            {
+                voxelVisibilityDebug[counter++] = double(9945.0);
+            }
+        }
+
+        prd.hitPosition = vec3(0.0);
+        prd.hitNormal   = vec3(0.0);
+        prd.distance    = -1.0;
+        traceRayEXT(staticraytracedaccelerationstructure, // acceleration structure
+                    rayFlags,                       // rayFlags
+                    0xFF,                           // cullMask
+                    0,                              // sbtRecordOffset
+                    0,                              // sbtRecordStride
+                    0,                              // missIndex
+                    rayOrigin,                      // ray origin
+                    tMin,                           // ray min range
+                    direction2,                     // ray direction
+                    tMax,                           // ray max range
+                    0                               // payload (location = 0)
+        );
+        if((prd.distance != -1) && (distance(originalHitPosition, prd.hitPosition) < 2.0))
+        {
+            originalNormal += prd.hitNormal;
+            numberNormal += 1.0;
+            if(record)
+            {
+                voxelVisibilityDebug[counter++] = double(10045.0);
+            }
+        }
+
+        prd.hitPosition = vec3(0.0);
+        prd.hitNormal   = vec3(0.0);
+        prd.distance    = -1.0;
+        traceRayEXT(staticraytracedaccelerationstructure, // acceleration structure
+                    rayFlags,                       // rayFlags
+                    0xFF,                           // cullMask
+                    0,                              // sbtRecordOffset
+                    0,                              // sbtRecordStride
+                    0,                              // missIndex
+                    rayOrigin,                      // ray origin
+                    tMin,                           // ray min range
+                    direction3,                     // ray direction
+                    tMax,                           // ray max range
+                    0                               // payload (location = 0)
+        );
+        if((prd.distance != -1) && (distance(originalHitPosition, prd.hitPosition) < 2.0))
+        {
+            originalNormal += prd.hitNormal;
+            numberNormal   += 1.0;
+            if(record)
+            {
+                voxelVisibilityDebug[counter++] = double(12045.0);
+            }
+        }
+        
+        originalNormal /= numberNormal;
+        originalNormal = normalize(originalNormal);
+        prd.hitNormal  = originalNormal;
+
+        ivec3 occupiedVoxelCoordinates = worldToVoxelSpaceInteger(prd.hitPosition);
+        bool voxelOccupied             = isVoxelOccupied(getHashedIndex(originalOccupiedVoxelCoordinates));
+
+        if(record)
+        {
+            voxelVisibilityDebug[counter++] = double(14010.0);
+            voxelVisibilityDebug[counter++] = double(occupiedVoxelCoordinates.x);
+            voxelVisibilityDebug[counter++] = double(occupiedVoxelCoordinates.y);
+            voxelVisibilityDebug[counter++] = double(occupiedVoxelCoordinates.z);
+            voxelVisibilityDebug[counter++] = double(14020.0);
+            voxelVisibilityDebug[counter++] = double(distance(vec3(g_voxelTextureCoordinates), vec3(occupiedVoxelCoordinates)));
+            voxelVisibilityDebug[counter++] = double(14025.0);
+        }
+
+        // There can be cases where a ray intersects static geometry that did nt generated a voxel in the voxelization step due to the lower 
+        // voxelization resolution. Make sure the voxel is occupied.
+        if(voxelOccupied)
+        {
+            if((distance(vec3(g_voxelTextureCoordinates), vec3(originalOccupiedVoxelCoordinates)) > 0.0))
+            {
+                // TODO: Use a 3D texture and avoid those buffers!
+                uint hashedIndexFound = getHashedIndex(originalOccupiedVoxelCoordinates);
+                uvec2 findVoxelResult = findHashedCompactedPositionIndex(uvec3(originalOccupiedVoxelCoordinates), hashedIndexFound);
+
+                if(record)
+                {
+                    voxelVisibilityDebug[counter++] = double(15100.0);
+                    voxelVisibilityDebug[counter++] = double(findVoxelResult.x);
+                    voxelVisibilityDebug[counter++] = double(findVoxelResult.y);
+                    voxelVisibilityDebug[counter++] = double(15200.0);
+                    voxelVisibilityDebug[counter++] = double(hashedIndexFound);
+                    voxelVisibilityDebug[counter++] = double(15300.0);
+                }
+
+                if(findVoxelResult.y == 1)
+                {
+                    int startIndex                               = (voxelIndex * int(NUMBER_DESIRED_POINT) * 6) + rayFace * int(NUMBER_DESIRED_POINT);
+                    vec3 direction                               = (prd.hitNormal * 0.5) + vec3(0.5);
+                    direction                                   *= 255.0;
+
+                    uint encodedValue                            = encodeHitInformation(distance(rayOrigin, originalHitPosition), prd.hitNormal);
+                    voxelVisibility4Bytes[startIndex + rayIndex] = encodedValue;
+
+                    if(record)
+                    {
+                        voxelVisibilityDebug[counter++] = double(16100.0);
+                        voxelVisibilityDebug[counter++] = double(startIndex);
+                        voxelVisibilityDebug[counter++] = double(startIndex + rayIndex);
+                        voxelVisibilityDebug[counter++] = double(16100.0);
+                        voxelVisibilityDebug[counter++] = double(direction.x);
+                        voxelVisibilityDebug[counter++] = double(direction.y);
+                        voxelVisibilityDebug[counter++] = double(direction.z);
+                        voxelVisibilityDebug[counter++] = double(16200.0);
+                        voxelVisibilityDebug[counter++] = double(rayOrigin.x);
+                        voxelVisibilityDebug[counter++] = double(rayOrigin.y);
+                        voxelVisibilityDebug[counter++] = double(rayOrigin.z);
+                        voxelVisibilityDebug[counter++] = double(16300.0);
+                        voxelVisibilityDebug[counter++] = double(originalHitPosition.x);
+                        voxelVisibilityDebug[counter++] = double(originalHitPosition.y);
+                        voxelVisibilityDebug[counter++] = double(originalHitPosition.z);
+                        voxelVisibilityDebug[counter++] = double(16400.0);
+                        voxelVisibilityDebug[counter++] = double(prd.hitNormal.x);
+                        voxelVisibilityDebug[counter++] = double(prd.hitNormal.y);
+                        voxelVisibilityDebug[counter++] = double(prd.hitNormal.z);
+                        voxelVisibilityDebug[counter++] = double(16500.0);
+                        voxelVisibilityDebug[counter++] = double(encodedValue);
+                        voxelVisibilityDebug[counter++] = double(16550.0);
+                        voxelVisibilityDebug[counter++] = double(originalOccupiedVoxelCoordinates.x);
+                        voxelVisibilityDebug[counter++] = double(originalOccupiedVoxelCoordinates.y);
+                        voxelVisibilityDebug[counter++] = double(originalOccupiedVoxelCoordinates.z);
+                        voxelVisibilityDebug[counter++] = double(17000.0);
+                        vec3 rebuiltPosition = rayOrigin + rayDirectionValue * distance(rayOrigin, originalHitPosition);
+                        voxelVisibilityDebug[counter++] = double(rebuiltPosition.x);
+                        voxelVisibilityDebug[counter++] = double(rebuiltPosition.y);
+                        voxelVisibilityDebug[counter++] = double(rebuiltPosition.z);
+                        ivec3 rebuiltCoordinates = worldToVoxelSpaceInteger(rebuiltPosition);
+                        voxelVisibilityDebug[counter++] = double(17100.0);
+                        voxelVisibilityDebug[counter++] = double(rebuiltCoordinates.x);
+                        voxelVisibilityDebug[counter++] = double(rebuiltCoordinates.y);
+                        voxelVisibilityDebug[counter++] = double(rebuiltCoordinates.z);
+                        voxelVisibilityDebug[counter++] = double(17200.0);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

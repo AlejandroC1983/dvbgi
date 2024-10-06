@@ -1,0 +1,292 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#extension GL_EXT_shader_8bit_storage : enable
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+  // WARNING 4 32-bit ALLIGNMENT
+  uint localWorkGroupsXDimension; //!< Dispatch command x dimension size
+  uint localWorkGroupsYDimension; //!< Dispatch command y dimension size
+  uint numThreadExecuted;         //!< Number thread executed
+  uint voxelizationSize;          //!< Size of the voxelization texture
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to the instance of the m_irradiancePaddingTagTilesIndexBuffer buffer used to store the indices of 
+* the tiles that need to be processed for the padding computation */
+layout (binding = 1) buffer coherent irradiancePaddingTagTilesIndexBuffer
+{
+    uint irradiancePaddingTagTilesIndex[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for debug purposes */
+layout (binding = 2) buffer coherent staticVoxelPaddingDebugBuffer
+{
+    double staticVoxelPaddingDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 3) buffer coherent voxelOccupiedBuffer
+{
+   uint voxelOccupied[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Shader storage buffer with the irradiance at each major axis direction */
+layout (binding = 4) buffer coherent lightBounceVoxelIrradianceBuffer
+{
+    uint lightBounceVoxelIrradiance[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Shader storage buffer used as a temporal copy of lightBounceVoxelIrradianceBuffer when 
+* performing the gaussian blur passes with 3^3 kernel size */
+layout (binding = 5) buffer coherent lightBounceVoxelIrradianceTempBuffer
+{
+    uint lightBounceVoxelIrradianceTemp[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// Image load / store
+layout(binding = 6,  r11f_g11f_b10f) uniform writeonly image3D irradiance3DStaticNegativeX;
+layout(binding = 7,  r11f_g11f_b10f) uniform writeonly image3D irradiance3DStaticPositiveX;
+layout(binding = 8,  r11f_g11f_b10f) uniform writeonly image3D irradiance3DStaticNegativeY;
+layout(binding = 9,  r11f_g11f_b10f) uniform writeonly image3D irradiance3DStaticPositiveY;
+layout(binding = 10, r11f_g11f_b10f) uniform writeonly image3D irradiance3DStaticNegativeZ;
+layout(binding = 11, r11f_g11f_b10f) uniform writeonly image3D irradiance3DStaticPositiveZ;
+
+// Sampling
+layout(binding = 12) uniform usampler3D staticVoxelNeighbourInfo;
+layout(binding = 13) uniform usampler3D staticVoxelIndexTexture;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// DEFINES
+#define NUMBER_VOXEL_NEIGHBOUR                  27
+#define NUMBER_VOXEL_FACE                        6
+#define NUMBER_THREAD_LOCAL_WORKGROUP            8
+#define NUMBER_THREAD_PER_TILE_VOXEL             4 //!< Number of threads that process the information of each tile voxel
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+int   g_voxelSizeInt;   //!< Size of the voxelization texture
+float g_voxelSizeFloat; //!< Size of the voxelization texture
+const uint g_maxValue = 4294967295;
+
+// SHARED VARIABLES
+shared uint s_tileIndex;                                                    //!< Index of the tile to be analysed in the local workgroup
+shared uint s_neighbourInfo[TILE_SIDE][TILE_SIDE][TILE_SIDE];               //!< Shared variable with the information about occupied neigbours for each of the voxels the current tile processed contains
+shared uint s_irradianceIndex[TILE_SIDE + 2][TILE_SIDE + 2][TILE_SIDE + 2]; //!< Shared variable with the irradiance index to be loaded in s_irradianceInfo, used to avoid loading more than once the irraidance information by the threads loading all occupied voxels
+shared vec3 s_irradianceInfo[TILE_SIDE + 2][TILE_SIDE + 2][TILE_SIDE + 2];  //!< Shared variable with the irradiance information of all occupied voxels inside the tile and for all voxels around it (i.e., if the tile has size 2^3, the irraidance ifnromation will be loaded for all those voxels and all the neighbours, in a set of (2 + 2)^3 voxels)
+shared vec4 s_irradianceAccumulated[TILE_SIDE][TILE_SIDE][TILE_SIDE];       //!< Shared variable where each thread will accumulate the irraidance from the tile voxel being processed
+shared bool s_tileVoxelIsOccupied[TILE_SIDE][TILE_SIDE][TILE_SIDE];         //!< Shared variable to store whether each voxel in the tile being processed is occupied or empty regarding static voxels. The indices [0, ..., TILE_SIZE_TOTAL - 1] map with offsets arrayTileNeighbourCoordinates[0], ..., arrayTileNeighbourCoordinates[TILE_SIZE_TOTAL - 1] from the base tile coordinates transformed into voxel coordinates
+
+//shared vec4 s_irradianceMean[TILE_SIZE_TOTAL][NUMBER_THREAD_PER_TILE_VOXEL]; //!< Shared variable where each thread will accumulate the irraidance from the tile voxel being processed
+
+bool record;
+uint counter;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array offsets to know the coordinates of any voxel within the current tile */
+ivec3 arrayTileNeighbourCoordinates[TILE_SIZE_TOTAL] = 
+{
+    ivec3( 0,  0,  0), // i = 0, j = 0, k = 0, index = 0, 4*i * + 2*j + k
+    ivec3( 0,  0,  1), // i = 0, j = 0, k = 1, index = 1
+    ivec3( 0,  1,  0), // i = 0, j = 1, k = 0, index = 2
+    ivec3( 0,  1,  1), // i = 0, j = 1, k = 1, index = 3
+    ivec3( 1,  0,  0), // i = 1, j = 0, k = 0, index = 4
+    ivec3( 1,  0,  1), // i = 1, j = 0, k = 1, index = 5
+    ivec3( 1,  1,  0), // i = 1, j = 1, k = 0, index = 6
+    ivec3( 1,  1,  1)  // i = 1, j = 1, k = 1, index = 7
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Array offsets to store the result of the padding mean value for each not occupied voxel neighbour around g_voxelTextureCoordinates in a 3^3 neighbourhood */
+ivec3 arrayNeighbourStoreCoordinates[NUMBER_VOXEL_NEIGHBOUR] = 
+{
+    ivec3(-1, -1, -1),
+    ivec3(-1, -1,  0),
+    ivec3(-1, -1,  1),
+    ivec3(-1,  0, -1),
+    ivec3(-1,  0,  0),
+    ivec3(-1,  0,  1),
+    ivec3(-1,  1, -1),
+    ivec3(-1,  1,  0),
+    ivec3(-1,  1,  1),
+    ivec3( 0, -1, -1),
+    ivec3( 0, -1,  0),
+    ivec3( 0, -1,  1),
+    ivec3( 0,  0, -1),
+    ivec3( 0,  0,  0),
+    ivec3( 0,  0,  1),
+    ivec3( 0,  1, -1),
+    ivec3( 0,  1,  0),
+    ivec3( 0,  1,  1),
+    ivec3( 1, -1, -1),
+    ivec3( 1, -1,  0),
+    ivec3( 1, -1,  1),
+    ivec3( 1,  0, -1),
+    ivec3( 1,  0,  0),
+    ivec3( 1,  0,  1),
+    ivec3( 1,  1, -1),
+    ivec3( 1,  1,  0),
+    ivec3( 1,  1,  1),
+};
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Store irradiance information for the coordinates and voxel face given into the corresponding texture for static voxels
+* @param faceIndex   [in] face index for the texture where to store irradiance information
+* @param coordinates [in] texture coordinates where to store the irradiance
+* @param irradiance  [in] irradiance value to store
+* @return nothing */
+void storeStaticIrradianceInformation(uint faceIndex, ivec3 coordinates, vec3 irradiance)
+{
+    switch (faceIndex)
+    {
+        case 0:
+        {
+            imageStore(irradiance3DStaticNegativeX, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 1:
+        {
+            imageStore(irradiance3DStaticPositiveX, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 2:
+        {
+            imageStore(irradiance3DStaticNegativeY, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 3:
+        {
+            imageStore(irradiance3DStaticPositiveY, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 4:
+        {
+            imageStore(irradiance3DStaticNegativeZ, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 5:
+        {
+            imageStore(irradiance3DStaticPositiveZ, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+    };
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the tile 3D position given with hashed value as parameter
+* @param value [in] tile index value to unhash
+* @return unhashed tile value for parameter value */
+ivec3 unhashTileValue(uint value)
+{
+    float voxelSizeHalf = g_voxelSizeFloat / float(TILE_SIDE);
+    float number        = float(value) / voxelSizeHalf;
+
+    ivec3 result;
+    float integerPart;
+    float fractional = modf(number, integerPart);
+    result.z         = int(fractional * voxelSizeHalf);
+    number          /= voxelSizeHalf;
+    fractional       = modf(number, integerPart);
+    result.y         = int(fractional * voxelSizeHalf);
+    result.x         = int(integerPart);
+
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+ivec3 unhashValue(uint value, uint voxelSize)
+{
+    float voxelSizeFloat = float(voxelSize);
+    float number     = float(value) / voxelSizeFloat;
+
+    ivec3 result;
+    float integerPart;
+    float fractional = modf(number, integerPart);
+    result.z         = int(fractional * voxelSizeFloat);
+    number          /= voxelSizeFloat;
+    fractional       = modf(number, integerPart);
+    result.y         = int(fractional * voxelSizeFloat);
+    result.x         = int(integerPart);
+
+    return result;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Does the integer modulo operation x mod(y) returning the interger result
+* @param x [in] value to apply module to
+* @param y [in] value to apply module with
+* @return retul of the operation x mod(y) */
+double modulo(double x, double y)
+{
+    return x - (y * floor(x / y));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupied if the current voxel is occupied by at least one fragment, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupied(uint indexHashed)
+{
+    float integerPart;
+    float indexDecimalFloat = float(indexHashed) / 32.0;
+    float fractional        = modf(indexDecimalFloat, integerPart);
+    uint index              = uint(integerPart);
+    uint bit                = uint(fractional * 32.0);
+    bool result             = ((voxelOccupied[index] & (1 << bit)) > 0);
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** hashed value for texture coordinates given as parameter in a voxelization of size given by g_voxelSizeInt
+* @param texcoord  [in] texture coordinates
+* @param voxelSize [in] voxelization size
+* @return hashed value */
+uint getHashedIndex(ivec3 texcoord)
+{
+    return uint(texcoord.x * g_voxelSizeInt * g_voxelSizeInt + texcoord.y * g_voxelSizeInt + texcoord.z);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

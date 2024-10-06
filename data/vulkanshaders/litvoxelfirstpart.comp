@@ -1,0 +1,320 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#extension GL_EXT_ray_query : enable
+#extension GL_EXT_shader_8bit_storage : enable
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+	// WARNING 4 32-bit ALLIGNMENT
+	mat4  shadowViewProjection;        //!< Shadow mapping view projection matrix
+	vec4  sceneMin;                    //!< Minimum value of the scene's aabb
+	vec4  sceneMax;                    //!< Maximum value of the scene's aabb
+	vec4  sceneExtent;                 //!< Extent of the scene
+	vec4  lightPosition;               //!< Light position in world coordinates
+	vec4  lightForward;                //!< Forward direction of the light vector
+	uint  localWorkGroupsXDimension;   //!< Dispatch command x dimension size
+	uint  localWorkGroupsYDimension;   //!< Dispatch command y dimension size 
+	float voxelSize;                   //!< 3D voxel texture size
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for accelerating the search of elements in voxelFirstIndexCompactedBuffer and
+* voxelHashedPositionCompactedBuffer. Contains the index to the first element in
+* voxelFirstIndexCompactedBuffer and voxelHashedPositionCompactedBuffer for fixed
+* 3D voxelization values, like (0,0,0), (0,0,128), (0,1,0), (0,1,128), (0,2,0), (0,2,128), ... */
+layout (binding = 1) buffer coherent IndirectionIndexBuffer
+{
+	uint IndirectionIndex[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for accelerating the search of elements in voxelFirstIndexCompactedBuffer and
+* voxelHashedPositionCompactedBuffer. Contains the amount of elements at the same index in
+* IndirectionIndexBuffer, to know how many elements to the right are there when using the
+* value at the same index of IndirectionIndexBuffe in voxelFirstIndexCompactedBuffer */
+layout (binding = 2) buffer coherent IndirectionRankBuffer
+{
+	uint IndirectionRank[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the hashed position of the 3D volume voxelization coordinates the fragment
+* data in the same index at the voxelFirstIndexCompactedBuffer buffer
+* occupied initially in the non-compacted buffer */
+layout (binding = 3) buffer coherent voxelHashedPositionCompactedBuffer
+{
+	uint voxelHashedPositionCompacted[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** For debug */
+layout (binding = 4) buffer coherent litVoxelDebugBuffer
+{
+	float litVoxelDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 5) buffer coherent voxelOccupiedBuffer
+{
+	uint voxelOccupied[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used ot tag whether a voxel has been processed to compute irradiance arriving at each of its six faces. */
+layout (binding = 6) buffer coherent lightBounceProcessedVoxelBuffer
+{
+	float lightBounceProcessedVoxel[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used to store the hashed coordinates of all the voxels generated dynamically */
+layout (binding = 7) buffer coherent dynamicVoxelBuffer
+{
+	uint dynamicVoxel[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 8) buffer coherent voxelOccupiedDynamicBuffer
+{
+	uint voxelOccupiedDynamic[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer of lit test voxels having information on a per-byte approach (each byte has information on whether any 
+* voxel face is lit and what voxel faces are lit at bit level, with info [no info][-x][+x][-y][+y][-z][+z][AnyLitVoxelFace]) */
+layout (binding = 9) buffer coherent litTestVoxelPerByteBuffer
+{
+	uint8_t litTestVoxelPerByte[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer of dynamic lit test voxels having information on a per-byte approach (each byte has information on whether any 
+* voxel face is lit and what voxel faces are lit at bit level, with info [no info][-x][+x][-y][+y][-z][+z][AnyLitVoxelFace]) */
+layout (binding = 10) buffer coherent litTestDynamicVoxelPerByteBuffer
+{
+	uint8_t litTestDynamicVoxelPerByte[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout(binding = 11) uniform accelerationStructureEXT raytracedaccelerationstructure;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout(binding = 12) uniform usampler3D staticVoxelIndexTexture;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Push constant to know whether the current dispatch is being used for testing static or dynamic voxels and the amount of voxels to test visibilty for */
+layout(push_constant) uniform pushConstant
+{
+	vec4 pushConstantIsTestingStaticVoxel;
+} myPushConstant;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+const uint maxValue          = 4294967295;
+const uint maxIterationIndex = 10;         //!< NOTE: this value could be obtained in the voxelization step...
+
+vec3  g_sceneExtent;       //!< Scene extent
+vec3  g_lightPosition;     //!< Light position
+vec3  g_sceneMin;          //!< Scene min
+float g_voxelSize;         //!< Size of the voxelization texture
+vec3  g_arrayTestPoint[8]; //!< Temporary variable used to store testing points generated for each voxel face
+
+bool record;
+uint counter;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// TODO: improve using step()
+/** Verify if the coordinates given as parameter are inside the aabb given by min Value and maxValue (closed interval)
+* @param coordinates [in] coordinates to verify
+* @param minValue    [in] min value for the test
+* @param maxValue    [in] max value for the test
+* @return true if outside, false itherwise */
+bool outsideTextureCoordinatesAABB(ivec3 coordinates, ivec3 minValue, ivec3 maxValue)
+{
+	return ((coordinates.x < minValue.x) || (coordinates.y < minValue.y) || (coordinates.z < minValue.z) ||
+	        (coordinates.x > maxValue.x) || (coordinates.y > maxValue.y) || (coordinates.z > maxValue.z));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes texture space coordinates of the world coordinates given as parameter
+* @param worldCoordinates [in] world coordinates
+* @return texture space coordinates of the world coordinates given as parameter */
+uvec3 worldToVoxelSpace(vec3 worldCoordinates)
+{
+	vec3 result = worldCoordinates;
+	result     -= myMaterialData.sceneMin.xyz;
+	result     /= myMaterialData.sceneExtent.xyz;
+	result     *= g_voxelSize;
+
+	return uvec3(uint(result.x), uint(result.y), uint(result.z));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes world space coordinates for 3D texture coordinates
+* @param coordinates [in] texture coordinates
+* @return world coordinates of the voxel coordinates given as parameter */
+vec3 voxelSpaceToWorld(uvec3 coordinates)
+{
+	vec3 result = vec3(float(coordinates.x), float(coordinates.y), float(coordinates.z));
+	result     /= vec3(g_voxelSize);
+	result     *= g_sceneExtent;
+	result     += g_sceneMin;
+	result     += (g_sceneExtent / g_voxelSize) * 0.5;
+	return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+uvec3 unhashValue(uint value)
+{
+	float sizeFloat = g_voxelSize;
+	float number    = float(value) / sizeFloat;
+
+	uvec3 result;
+	float integerPart;
+	float fractional = modf(number, integerPart);
+	result.z         = uint(fractional * sizeFloat);
+	number          /= sizeFloat;
+	fractional       = modf(number, integerPart);
+	result.y         = uint(fractional * sizeFloat);
+	result.x         = uint(integerPart);
+
+	return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+void generateTestingPoints(vec3 position)
+{
+	vec3 offset0 = (g_sceneExtent / g_voxelSize) * 0.475;
+
+	g_arrayTestPoint[0] = position + vec3( -offset0.x, -offset0.y, -offset0.z);
+	g_arrayTestPoint[1] = position + vec3( -offset0.x, -offset0.y, +offset0.z);
+	g_arrayTestPoint[2] = position + vec3( -offset0.x, +offset0.y, -offset0.z);
+	g_arrayTestPoint[3] = position + vec3( -offset0.x, +offset0.y, +offset0.z);
+	g_arrayTestPoint[4] = position + vec3( +offset0.x, -offset0.y, -offset0.z);
+	g_arrayTestPoint[5] = position + vec3( +offset0.x, -offset0.y, +offset0.z);
+	g_arrayTestPoint[6] = position + vec3( +offset0.x, +offset0.y, -offset0.z);
+	g_arrayTestPoint[7] = position + vec3( +offset0.x, +offset0.y, +offset0.z);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Search in voxelHashedPositionCompactedBuffer for the index of the hashed value
+* of the texcoord parameter.
+* @param texcoord       [in] 3D texture coordinates to find index for
+* @param hashedPosition [in] texcoord parameter hashed texture coordinates
+* @return uvec2 with index in .x field and test result in .y field */
+uvec2 findHashedCompactedPositionIndex(uvec3 texcoord, uint hashedPosition)
+{
+	// TODO: Sample texture through texelFetch
+	// TODO: Initialise staticVoxelIndexTexture with maxValue value
+	uint index = texelFetch(staticVoxelIndexTexture, ivec3(texcoord), 0).r;
+
+	if(index != 4294967295)
+	{
+		return uvec2(index, 1);
+	}
+
+	return uvec2(0, 0);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupied if the current voxel is occupied by one voxel, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupied(uint indexHashed)
+{
+	float integerPart;
+	float indexDecimalFloat = float(indexHashed) / 32.0;
+	float fractional        = modf(indexDecimalFloat, integerPart);
+	uint index              = uint(integerPart);
+	uint bit                = uint(fractional * 32.0);
+	bool result             = ((voxelOccupied[index] & (1 << bit)) > 0);
+	return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupiedDynamic if the current voxel is occupied by one voxel, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupiedDynamic(uint indexHashed)
+{
+	float integerPart;
+	float indexDecimalFloat = float(indexHashed) / 32.0;
+	float fractional        = modf(indexDecimalFloat, integerPart);
+	uint index              = uint(integerPart);
+	uint bit                = uint(fractional * 32.0);
+	bool result             = ((voxelOccupiedDynamic[index] & (1 << bit)) > 0);
+	return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Set as lit the voxel face with index given as parameter, for the voxel face given as parameter.
+* Using the bit number 6 as reference for any voxel face being set as lit, bits {0,1,2,3,4,5} are 
+* used to tag as lit specific voxel faces as lit, in particular {-x,+x,-y,+y,-z,+z}
+* @param indexHashed [in] voxel index to set as lit
+* @return nothing */
+void setVoxelFaceLit(uint indexHashed)
+{
+	litTestVoxelPerByte[indexHashed] = uint8_t(1);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Set as lit the dynamic voxel face with index given as parameter, for the dynamic voxel face given as parameter.
+* Using the bit number 6 as reference for any voxel face being set as lit, bits {0,1,2,3,4,5} are 
+* used to tag as lit specific voxel faces as lit, in particular {-x,+x,-y,+y,-z,+z}
+* @param indexHashed [in] voxel index to set as lit
+* @return nothing */
+void setDynamicVoxelFaceLit(uint indexHashed)
+{
+	litTestDynamicVoxelPerByte[indexHashed] = uint8_t(1);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////

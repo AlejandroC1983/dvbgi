@@ -1,0 +1,153 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+  // WARNING 4 32-bit ALLIGNMENT
+  uint localWorkGroupsXDimension; //!< Dispatch command x dimension size
+  uint localWorkGroupsYDimension; //!< Dispatch command y dimension size
+  uint numThreadExecuted;         //!< Number of total thread executed
+  uint voxelizationSize;          //!< Size of the voxelization texture
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to store all the dynamically generated voxels that are visible from camera, this buffer has
+* size DynamicVoxelCopyToBufferTechnique::m_maxDynamicVoxel */
+layout (binding = 1) buffer coherent cameraVisibleDynamicVoxelBuffer
+{
+    uint cameraVisibleDynamicVoxel[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to store the irradiance per voxel face of each of the camera dynamic visible voxels */
+layout (binding = 2) buffer coherent cameraVisibleDynamicVoxelIrradianceBuffer
+{
+    float cameraVisibleDynamicVoxelIrradiance[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for debug purposes */
+layout (binding = 3) buffer coherent dynamicCopyIrradianceDebugBuffer
+{
+    float dynamicCopyIrradianceDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// Image load / store
+layout(binding = 4, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DDynamicNegativeX;
+layout(binding = 5, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DDynamicPositiveX;
+layout(binding = 6, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DDynamicNegativeY;
+layout(binding = 7, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DDynamicPositiveY;
+layout(binding = 8, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DDynamicNegativeZ;
+layout(binding = 9, r11f_g11f_b10f) uniform coherent volatile image3D  irradiance3DDynamicPositiveZ;
+
+// DEFINES
+#define NUMBER_VOXEL_FACE                        6
+#define NUMBER_IRRADIANCE_FIELDS_PER_VOXEL_FACE  3
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+float g_voxelSizeFloat; //!< Size of the voxelization texture
+
+bool record;
+uint counter;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+ivec3 unhashValue(uint value)
+{
+  float number     = float(value) / g_voxelSizeFloat;
+
+  ivec3 result;
+  float integerPart;
+  float fractional = modf(number, integerPart);
+  result.z         = int(fractional * g_voxelSizeFloat);
+  number          /= g_voxelSizeFloat;
+  fractional       = modf(number, integerPart);
+  result.y         = int(fractional * g_voxelSizeFloat);
+  result.x         = int(integerPart);
+
+  return result;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Does the integer modulo operation x mod(y) returning the interger result
+* @param x [in] value to apply module to
+* @param y [in] value to apply module with
+* @return retul of the operation x mod(y) */
+double modulo(double x, double y)
+{
+    return x - (y * floor(x / y));
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Store irradiance information for the coordinates and voxel face given into the corresponding texture
+* @param faceIndex   [in] face index for the texture where to store irradiance information
+* @param coordinates [in] texture coordinates where to store the irradiance
+* @param irradiance  [in] irradiance value to store
+* @return nothing */
+void storeIrradianceInformation(int faceIndex, ivec3 coordinates, vec3 irradiance)
+{
+    switch (faceIndex)
+    {
+        case 0:
+        {
+            imageStore(irradiance3DDynamicNegativeX, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 1:
+        {
+            imageStore(irradiance3DDynamicPositiveX, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 2:
+        {
+            imageStore(irradiance3DDynamicNegativeY, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 3:
+        {
+            imageStore(irradiance3DDynamicPositiveY, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 4:
+        {
+            imageStore(irradiance3DDynamicNegativeZ, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+        case 5:
+        {
+            imageStore(irradiance3DDynamicPositiveZ, coordinates, vec4(irradiance, 0.0));
+            break;
+        }
+    };
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -1,0 +1,45 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+	const uint NUM_WORKGROUP_Y_DIMENSION = myMaterialData.localWorkGroupsYDimension;
+	uint idx                             = gl_WorkGroupID.x * NUM_WORKGROUP_Y_DIMENSION * THREAD_PER_LOCAL_WORKGROUP + gl_WorkGroupID.y * THREAD_PER_LOCAL_WORKGROUP + gl_LocalInvocationIndex;
+    g_voxelSizeInt                       = int(myMaterialData.voxelizationSize);
+    g_voxelSizeFloat                     = float(g_voxelSizeInt);
+
+    uint i;
+
+	for(i = idx * 32; i < idx * 32 + 32; ++i)
+	{
+		if(uint(cameraVisibleVoxelPerByte[i]) > 0)
+		{
+			ivec3 voxelCoordinates = unhashValue(i);
+			
+			tagTilesEmptyNeighbouringVoxels(voxelCoordinates);
+            tagTileFilteringVoxel(voxelCoordinates);
+		}
+
+		if(uint(cameraVisibleDynamicVoxelPerByte[i]) > 0)
+		{
+			ivec3 voxelCoordinates                        = unhashValue(i);
+			cameraVisibleDynamicVoxelPerByteTagProcess[i] = uint8_t(1);
+
+			setSurroundingDynamicOccupiedVoxels(voxelCoordinates);			
+        }
+	}
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

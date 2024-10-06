@@ -1,0 +1,286 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#extension GL_EXT_shader_8bit_storage : enable
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+	// WARNING 4 32-bit ALLIGNMENT
+	uint localWorkGroupsXDimension;   //!< Dispatch command x dimension size
+	uint localWorkGroupsYDimension;   //!< Dispatch command y dimension size 
+	uint numberElementToProcess;      //!< Maximum number of elements to process
+    int  voxelizationSize;            //!< Voxel size in w field
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used to tag those 2^3 tiles in the voxelization volume which have at least one 
+* occupied voxel that will be processed for filtering together with neighbouring voxels */
+layout (binding = 1) buffer coherent irradianceFilteringTagTilesBuffer
+{
+    uint8_t irradianceFilteringTagTiles[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer used to tag those 2^3 tiles in the voxelization volume which have at least one 
+* empty voxel that has at least one neighbour occupied static voxel that need padding to be computed */
+layout (binding = 2) buffer coherent irradiancePaddingTagTilesBuffer
+{
+    uint8_t irradiancePaddingTagTiles[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer of camera visible test dynamic voxels having information on a per-byte approach (each byte of the buffer has information whether a 
+* dynamic voxel is vislbe from camera or not, representing each byte's index in the buffer the hashed index of a voxel's coordinates) */
+layout (binding = 3) buffer coherent cameraVisibleDynamicVoxelPerByteBuffer
+{
+    uint8_t cameraVisibleDynamicVoxelPerByte[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer which will be used in ProcessCameraVisibleResultsTechnique to take all the occupied voxels from cameraVisibleDynamicVoxelPerByteBuffer 
+* and set those and their neighbouring voxels for processing */
+layout (binding = 4) buffer coherent cameraVisibleDynamicVoxelPerByteTagProcessBuffer
+{
+    uint8_t cameraVisibleDynamicVoxelPerByteTagProcess[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer of camera visible test static voxels having information on a per-byte approach (each byte of the buffer has information whether a 
+* dynamic voxel is vislbe from camera or not, representing each byte's index in the buffer the hashed index of a voxel's coordinates) */
+layout (binding = 5) buffer coherent cameraVisibleVoxelPerByteBuffer
+{
+    uint8_t cameraVisibleVoxelPerByte[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for debug purposes */
+layout (binding = 6) buffer coherent tagCameraVisibleDebugBuffer
+{
+    float tagCameraVisibleDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout(binding = 7) uniform usampler3D staticVoxelNeighbourInfo;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+int   g_voxelSizeInt;   // Size of the voxelization texture
+float g_voxelSizeFloat; // Size of the voxelization texture
+
+ivec3 g_arrayOffset[27] =
+{
+    ivec3(-1.0, -1.0, -1.0),
+    ivec3(-1.0, -1.0,  0.0),
+    ivec3(-1.0, -1.0,  1.0),
+    ivec3(-1.0,  0.0, -1.0),
+    ivec3(-1.0,  0.0,  0.0),
+    ivec3(-1.0,  0.0,  1.0),
+    ivec3(-1.0,  1.0, -1.0),
+    ivec3(-1.0,  1.0,  0.0),
+    ivec3(-1.0,  1.0,  1.0),
+    ivec3( 0.0, -1.0, -1.0),
+    ivec3( 0.0, -1.0,  0.0),
+    ivec3( 0.0, -1.0,  1.0),
+    ivec3( 0.0,  0.0, -1.0),
+    ivec3( 0.0,  0.0,  0.0),
+    ivec3( 0.0,  0.0,  1.0),
+    ivec3( 0.0,  1.0, -1.0),
+    ivec3( 0.0,  1.0,  0.0),
+    ivec3( 0.0,  1.0,  1.0),
+    ivec3( 1.0, -1.0, -1.0),
+    ivec3( 1.0, -1.0,  0.0),
+    ivec3( 1.0, -1.0,  1.0),
+    ivec3( 1.0,  0.0, -1.0),
+    ivec3( 1.0,  0.0,  0.0),
+    ivec3( 1.0,  0.0,  1.0),
+    ivec3( 1.0,  1.0, -1.0),
+    ivec3( 1.0,  1.0,  0.0),
+    ivec3( 1.0,  1.0,  1.0)
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+ivec3 unhashValue(uint value)
+{
+    float number     = float(value) / g_voxelSizeFloat;
+
+    ivec3 result;
+    float integerPart;
+    float fractional = modf(number, integerPart);
+    result.z         = int(fractional * g_voxelSizeFloat);
+    number          /= g_voxelSizeFloat;
+    fractional       = modf(number, integerPart);
+    result.y         = int(fractional * g_voxelSizeFloat);
+    result.x         = int(integerPart);
+
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Compute the tile coordinates for the ones given as paramete
+* @param coordinates [in] coordinates to compute tile coordinates from
+* @return tile coordinates for the ones given as parameter */
+ivec3 getTileCoordinates(ivec3 coordinates)
+{
+    return coordinates / ivec3(2); // Currently tiles have size 2^3
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Hash the given tile coordinates, to map to the irradiancePaddingTagTilesBuffer buffer
+* @param coordinates [in] coordinates to compute tile coordinates from
+* @return hashed index of the tile coordinates given as parameter */
+uint getTileHashedIndex(ivec3 tileCoordinates)
+{
+    int tileSize = g_voxelSizeInt / 2; // Currently tiles have size 2^
+    return tileCoordinates.x * tileSize * tileSize + tileCoordinates.y * tileSize + tileCoordinates.z;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Use a per-bit approach to flag dynamic lit voxels for the given index, which is a hashing of the 3D voxel position.
+* @param indexHashed [in] index of the dynamic voxel to set as lit (hashed voxel's 3D texture coordinates)
+* @return true if the previous bit was not set to one, meaning this is the first call that sets t o1 the bit */
+void setDynamicVoxelVisible(uint indexHashed)
+{
+    cameraVisibleDynamicVoxelPerByteTagProcess[indexHashed] = uint8_t(1);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Tag in irradiancePaddingTagTilesBuffer buffer those tiles which have static neighbouring voxels of the 
+* static voxel with coordinates given by the voxelCoordinates parameter which are not occupied.
+* @param voxelCoordinates [in] voxel coordinates to tag those tiles containing neighbours of this coordinates which are empty
+* @return nothing */
+void tagTilesEmptyNeighbouringVoxels(ivec3 voxelCoordinates)
+{
+    // TODO: Optimize
+    uint neighbourData = texelFetch(staticVoxelNeighbourInfo, voxelCoordinates, 0).r;
+    ivec3 emptyNeighbour;
+
+    int numTile = 0;
+    uint arrayTileIndex[8];
+    bool addTileIndex;
+
+    for(int i = 0; i < 27; ++i)
+    {
+        // Avoid the test for the voxel being tested, bit 14th will have that information
+        if(i == 13)
+        {
+            continue;
+        }
+
+        // Tag any tile containing an empty neighbour from the current voxel with coordinates given by voxelCoordinates
+        if((neighbourData & (1 << i)) == 0)
+        {
+            emptyNeighbour        = voxelCoordinates + g_arrayOffset[i];
+            emptyNeighbour.x      = clamp(emptyNeighbour.x, 0, g_voxelSizeInt - 1);
+            emptyNeighbour.y      = clamp(emptyNeighbour.y, 0, g_voxelSizeInt - 1);
+            emptyNeighbour.z      = clamp(emptyNeighbour.z, 0, g_voxelSizeInt - 1);
+            ivec3 tileCoordinates = getTileCoordinates(emptyNeighbour);
+            uint tileIndex        = getTileHashedIndex(tileCoordinates);
+            addTileIndex          = true;
+
+            for(int j = 0; ((j < 8) && (addTileIndex == true)); ++j)
+            {
+                if(arrayTileIndex[j] == tileIndex)
+                {
+                    addTileIndex = false;
+                }
+            }
+
+            if(addTileIndex)
+            {
+                arrayTileIndex[numTile] = tileIndex;
+                numTile++;
+            }
+        }
+    }
+
+    for(int i = 0; i < numTile; ++i)
+    {
+        irradiancePaddingTagTiles[arrayTileIndex[i]] = uint8_t(1);
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Tag in irradianceFilteringTagTilesBuffer buffer the tiles for the voxel with coordinates given
+* as paramter to be processed later for filtering static voxel irradiance
+* @param voxelCoordinates [in] voxel coordinates to tag its corresponding tile
+* @return nothing */
+void tagTileFilteringVoxel(ivec3 voxelCoordinates)
+{
+    ivec3 tileCoordinates                  = getTileCoordinates(voxelCoordinates);
+    uint tileIndex                         = getTileHashedIndex(tileCoordinates);
+    irradianceFilteringTagTiles[tileIndex] = uint8_t(1);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** hashed value for texture coordinates given as parameter in a voxelization of size g_voxelSizeInt
+* @param texcoord  [in] texture coordinates
+* @return hashed value */
+uint getHashedIndex(ivec3 texcoord)
+{
+    return texcoord.x * g_voxelSizeInt * g_voxelSizeInt + texcoord.y * g_voxelSizeInt + texcoord.z;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Test, for each voxel in the [-1,1]x[-1,1]x[-1,1] neighbourhood of coordinates, whether
+* there are any dynamic voxels and set them as occupied
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+void setSurroundingDynamicOccupiedVoxels(ivec3 coordinates)
+{
+    // TODO: Optimize
+    for(int i = -2; i <= 2; ++i)
+    {
+        for(int j = -2; j <= 2; ++j)
+        {
+            for(int k = -2; k <= 2; ++k)
+            {
+                if((i == 0) && (j == 0) && (k == 0))
+                {
+                    continue;
+                }
+
+                // TODO: Cluster this operation and add limits to the tagging coordinates within bounds
+
+                setDynamicVoxelVisible(getHashedIndex(ivec3(coordinates + ivec3(i, j, k))));
+            }
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

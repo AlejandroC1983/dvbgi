@@ -1,0 +1,126 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+	// WARNING 4 32-bit ALLIGNMENT
+	uint localWorkGroupsXDimension; //!< Number of dispatched local workgroups in the x dimension
+	uint localWorkGroupsYDimension; //!< Number of dispatched local workgroups in the y dimension
+	uint numThreadExecuted;         //!< Number of threads executed
+	uint voxelizationResolution;    //!< Size of the voxelization resolution texture
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 1) buffer coherent voxelOccupiedBuffer
+{
+	uint voxelOccupied[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Texture with infomation at bit level on whehter neighbouring voxels are occupied by static voxels or not
+* The neighbour voxel occupied information in encoded on a 32-bit unsigned int variable with bit index detailed below:
+* bit 0:  Information for neighbour voxel at offset (-1, -1, -1)
+* bit 1:  Information for neighbour voxel at offset (-1, -1,  0)
+* bit 2:  Information for neighbour voxel at offset (-1, -1,  1)
+* bit 3:  Information for neighbour voxel at offset (-1,  0, -1)
+* bit 4:  Information for neighbour voxel at offset (-1,  0,  0)
+* bit 5:  Information for neighbour voxel at offset (-1,  0,  1)
+* bit 6:  Information for neighbour voxel at offset (-1,  1, -1)
+* bit 7:  Information for neighbour voxel at offset (-1,  1,  0)
+* bit 8:  Information for neighbour voxel at offset (-1,  1,  1)
+* bit 9:  Information for neighbour voxel at offset ( 0, -1, -1)
+* bit 10: Information for neighbour voxel at offset ( 0, -1,  0)
+* bit 11: Information for neighbour voxel at offset ( 0, -1,  1)
+* bit 12: Information for neighbour voxel at offset ( 0,  0, -1)
+* bit 13: Information for neighbour voxel at offset ( 0,  0,  0)
+* bit 14: Information for neighbour voxel at offset ( 0,  0,  1)
+* bit 15: Information for neighbour voxel at offset ( 0,  1, -1)
+* bit 16: Information for neighbour voxel at offset ( 0,  1,  0)
+* bit 17: Information for neighbour voxel at offset ( 0,  1,  1)
+* bit 18: Information for neighbour voxel at offset ( 1, -1, -1)
+* bit 19: Information for neighbour voxel at offset ( 1, -1,  0)
+* bit 20: Information for neighbour voxel at offset ( 1, -1,  1)
+* bit 21: Information for neighbour voxel at offset ( 1,  0, -1)
+* bit 22: Information for neighbour voxel at offset ( 1,  0,  0)
+* bit 23: Information for neighbour voxel at offset ( 1,  0,  1)
+* bit 24: Information for neighbour voxel at offset ( 1,  1, -1)
+* bit 25: Information for neighbour voxel at offset ( 1,  1,  0)
+* bit 26: Information for neighbour voxel at offset ( 1,  1,  1) */
+layout(binding = 2, r32ui) uniform coherent volatile uimage3D staticVoxelNeighbourInfo;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+float g_voxelSize;    //!< Size of the voxelization texture
+int   g_voxelSizeInt; //!< Size of the voxelization texture (int)
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupied if the current voxel is occupied by at least one fragment, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupied(uint indexHashed)
+{
+    float integerPart;
+    float indexDecimalFloat = float(indexHashed) / 32.0;
+    float fractional        = modf(indexDecimalFloat, integerPart);
+    uint index              = uint(integerPart);
+    uint bit                = uint(fractional * 32.0);
+    bool result             = ((voxelOccupied[index] & (1 << bit)) > 0);
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+ivec3 unhashValue(uint value)
+{
+  	float number     = float(value) / g_voxelSize;
+
+  	ivec3 result;
+  	float integerPart;
+ 	float fractional = modf(number, integerPart);
+  	result.z         = int(fractional * g_voxelSize);
+  	number          /= g_voxelSize;
+  	fractional       = modf(number, integerPart);
+  	result.y         = int(fractional * g_voxelSize);
+  	result.x         = int(integerPart);
+
+  	return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** hashed value for texture coordinates given as parameter in a voxelization of size given by g_voxelSizeInt
+* @param texcoord  [in] texture coordinates
+* @param voxelSize [in] voxelization size
+* @return hashed value */
+uint getHashedIndex(ivec3 texcoord)
+{
+    return texcoord.x * g_voxelSizeInt * g_voxelSizeInt + texcoord.y * g_voxelSizeInt + texcoord.z;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

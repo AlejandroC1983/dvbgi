@@ -1,0 +1,148 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+	const uint NUM_WORKGROUP_Y_DIMENSION = myMaterialData.localWorkGroupsYDimension;
+	const uint numThreadExecuted         = myMaterialData.numThreadExecuted;
+	uint idx                             = gl_WorkGroupID.x * NUM_WORKGROUP_Y_DIMENSION * THREAD_PER_LOCAL_WORKGROUP + gl_WorkGroupID.y * THREAD_PER_LOCAL_WORKGROUP + gl_LocalInvocationIndex;
+
+	if(idx >= numThreadExecuted)
+	{
+		return;
+	}
+
+	uint numTileToProcess      = myMaterialData.numThreadExecuted / (NUMBER_VOXEL_FACE * THREAD_PER_LOCAL_WORKGROUP);
+	uint indexToProcess        = uint(modulo(double(gl_WorkGroupID.x), double(numTileToProcess))); 
+	uint voxelFace             = uint(gl_WorkGroupID.y);
+	g_voxelSizeInt             = int(myMaterialData.voxelizationSize);
+	g_voxelSizeFloat           = float(g_voxelSizeInt);
+	ivec3 voxelMaxCoordinates  = ivec3(g_voxelSizeInt - 1);
+
+	if(gl_LocalInvocationIndex == 0)
+	{
+		s_tileIndex = irradiancePaddingTagTilesIndex[indexToProcess];
+	}
+
+	barrier();
+
+	ivec3 tileCoordinatesStart = unhashTileValue(s_tileIndex);
+	ivec3 voxelCoordinates     = tileCoordinatesStart * ivec3(TILE_SIDE);
+
+	record  = false;
+	counter = idx * 25;
+
+	ivec3 offset                                        = arrayTileNeighbourCoordinates[gl_LocalInvocationIndex];
+	ivec3 coordinatesToLoad                             = voxelCoordinates + offset;
+	s_neighbourInfo[offset.x][offset.y][offset.z]       = 0;
+	s_tileVoxelIsOccupied[offset.x][offset.y][offset.z] = false;
+
+	if(all(greaterThanEqual(coordinatesToLoad, ivec3(0))) && all(lessThanEqual(coordinatesToLoad, voxelMaxCoordinates)))
+    {
+		s_neighbourInfo[offset.x][offset.y][offset.z] = texelFetch(staticVoxelNeighbourInfo, ivec3(coordinatesToLoad), 0).r;
+			    
+	    if((s_neighbourInfo[offset.x][offset.y][offset.z] & (1 << 13)) > 0)
+    	{
+    		s_tileVoxelIsOccupied[offset.x][offset.y][offset.z] = true;
+    	}
+    }
+
+	// To initialise the values of s_irradianceInfo, each local workgroup thread will set the value of some elements of s_irradianceInfo
+	ivec3 coordTemp;
+	for(uint i = 0; i < TILE_SIZE_TOTAL; ++i)
+	{
+		coordTemp                                                = unhashValue(8 * gl_LocalInvocationIndex + i, TILE_SIDE + 2);
+		s_irradianceInfo[coordTemp.x][coordTemp.y][coordTemp.z]  = vec3(0.0);
+		s_irradianceIndex[coordTemp.x][coordTemp.y][coordTemp.z] = g_maxValue;
+	}
+
+	barrier();
+
+	ivec3 loadCoordinatesIrradianceTexture;
+
+	s_irradianceAccumulated[offset.x][offset.y][offset.z] = vec4(0.0);
+	uint value                                            = s_neighbourInfo[offset.x][offset.y][offset.z];
+
+	if(value != 0)
+	{
+		for(int i = 0; i < 27; ++i)
+		{
+			if((value & (1 << i)) > 0)
+			{
+				loadCoordinatesIrradianceTexture = ivec3(voxelCoordinates + offset + arrayNeighbourStoreCoordinates[i]);
+
+				if(all(greaterThanEqual(loadCoordinatesIrradianceTexture, ivec3(0))) && all(lessThanEqual(loadCoordinatesIrradianceTexture, voxelMaxCoordinates)))
+		   		{
+				    ivec3 storeIrradianceCoordinates = offset + arrayNeighbourStoreCoordinates[i] + ivec3(1);
+				    s_irradianceIndex[storeIrradianceCoordinates.x][storeIrradianceCoordinates.y][storeIrradianceCoordinates.z] = getHashedIndex(loadCoordinatesIrradianceTexture);
+				}
+			}
+		}
+	}
+
+	barrier();
+
+	for(uint i = gl_LocalInvocationIndex * 8; i < (gl_LocalInvocationIndex * 8 + 8); ++i)
+	{
+		ivec3 testCoordinates = unhashValue(i, 4);
+		if(s_irradianceIndex[testCoordinates.x][testCoordinates.y][testCoordinates.z] != g_maxValue)
+		{
+			ivec3 loadCoordinates = ivec3(voxelCoordinates + testCoordinates + ivec3(-1));
+			uint index            = texelFetch(staticVoxelIndexTexture, ivec3(loadCoordinates), 0).r;
+		   	index                 = 12 * index + 2 * voxelFace;
+			uint xyComponent      = lightBounceVoxelIrradianceTemp[index + 0];
+			uint zComponent       = lightBounceVoxelIrradianceTemp[index + 1];
+			vec2 xyComponentFloat = unpackHalf2x16(xyComponent);
+			vec2 zComponentFloat  = unpackHalf2x16(zComponent);
+			vec3 irradianceVoxel  = vec3(xyComponentFloat.x, xyComponentFloat.y, zComponentFloat.x);
+
+			s_irradianceInfo[testCoordinates.x][testCoordinates.y][testCoordinates.z] = irradianceVoxel;
+		}
+	}
+
+	barrier();
+
+	vec4 irradianceValue = vec4(0.0);
+
+	if(!s_tileVoxelIsOccupied[offset.x][offset.y][offset.z])
+	{
+		for(int m = 0; m < 27; ++m)
+		{
+			ivec3 offsetLoad     = arrayNeighbourStoreCoordinates[m];
+			ivec3 coodinatesLoad = offset + offsetLoad + ivec3(1);
+			if(dot(s_irradianceInfo[coodinatesLoad.x][coodinatesLoad.y][coodinatesLoad.z], vec3(1.0)) > 0.0)
+			{
+				irradianceValue += vec4(s_irradianceInfo[coodinatesLoad.x][coodinatesLoad.y][coodinatesLoad.z].xyz, 1.0);
+			}
+		}
+
+		s_irradianceAccumulated[offset.x][offset.y][offset.z] = irradianceValue;
+	}
+
+	barrier();
+
+	vec4 irradianceAccumulated = s_irradianceAccumulated[offset.x][offset.y][offset.z];
+
+	if(s_irradianceAccumulated[offset.x][offset.y][offset.z].w > 0.0)
+	{
+		irradianceAccumulated.xyz /= irradianceAccumulated.w;
+		if(dot(irradianceAccumulated.xyz, vec3(1.0)) > 0.0)
+		{
+			storeStaticIrradianceInformation(voxelFace, ivec3(voxelCoordinates) + offset, irradianceAccumulated.xyz);
+		}
+	}
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

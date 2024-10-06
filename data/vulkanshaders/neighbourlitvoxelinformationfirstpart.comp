@@ -1,0 +1,188 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#extension GL_EXT_ray_query : enable
+#extension GL_EXT_shader_8bit_storage : enable
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+	// WARNING 4 32-bit ALLIGNMENT
+	uint  localWorkGroupsXDimension;   //!< Dispatch command x dimension size
+	uint  localWorkGroupsYDimension;   //!< Dispatch command y dimension size 
+	uint  numElementToProcess;         //!< Number of static voxels to process
+	float voxelSize;                   //!< 3D voxel texture size
+} myMaterialData;
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the hashed position of the 3D volume voxelization coordinates the fragment
+* data in the same index at the voxelFirstIndexCompactedBuffer buffer
+* occupied initially in the non-compacted buffer */
+layout (binding = 1) buffer coherent voxelHashedPositionCompactedBuffer
+{
+	uint voxelHashedPositionCompacted[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 2) buffer coherent voxelOccupiedBuffer
+{
+	uint voxelOccupied[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer of lit test voxels having information on a per-byte approach (each byte has information on whether any 
+* voxel face is lit and what voxel faces are lit at bit level, with info [no info][-x][+x][-y][+y][-z][+z][AnyLitVoxelFace]) */
+layout (binding = 3) buffer coherent litTestVoxelPerByteBuffer
+{
+	uint8_t litTestVoxelPerByte[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for debug purposes */
+layout (binding = 4) buffer coherent neighbourLitVoxelDebugBuffer
+{
+	double neighbourLitVoxelDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the information about what neighbour voxels are lit and the voxel itself
+* Encodes whether there is an occupied static and lit voxel neighbour of the one being analysed
+* at bit level, with information on each neighbour at bit index:
+* Index 0:  offset (-1, -1, -1)
+* Index 1:  offset (-1, -1,  0)
+* Index 2:  offset (-1, -1,  1)
+* Index 3:  offset (-1,  0, -1)
+* Index 4:  offset (-1,  0,  0)
+* Index 5:  offset (-1,  0,  1)
+* Index 6:  offset (-1,  1, -1)
+* Index 7:  offset (-1,  1,  0)
+* Index 8:  offset (-1,  1,  1)
+* Index 9:  offset ( 0, -1, -1)
+* Index 10: offset ( 0, -1,  0)
+* Index 11: offset ( 0, -1,  1)
+* Index 12: offset ( 0,  0, -1)
+* Index 13: offset ( 0,  0,  0)
+* Index 14: offset ( 0,  0,  1)
+* Index 15: offset ( 0,  1, -1)
+* Index 16: offset ( 0,  1,  0)
+* Index 17: offset ( 0,  1,  1)
+* Index 18: offset ( 1, -1, -1)
+* Index 19: offset ( 1, -1,  0)
+* Index 20: offset ( 1, -1,  1)
+* Index 21: offset ( 1,  0, -1)
+* Index 22: offset ( 1,  0,  0)
+* Index 23: offset ( 1,  0,  1)
+* Index 24: offset ( 1,  1, -1)
+* Index 25: offset ( 1,  1,  0)
+* Index 26: offset ( 1,  1,  1) */
+layout (binding = 5) buffer coherent neighbourLitVoxelInformationBuffer
+{
+	uint neighbourLitVoxelInformation[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+float g_voxelSize;    //!< Size of the voxelization texture
+int   g_voxelSizeInt; //!< Size of the voxelization texture
+
+bool record;
+uint counter;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// TODO: improve using step()
+/** Verify if the coordinates given as parameter are inside the aabb given by min Value and maxValue (closed interval)
+* @param coordinates [in] coordinates to verify
+* @param minValue    [in] min value for the test
+* @param maxValue    [in] max value for the test
+* @return true if outside, false itherwise */
+bool outsideTextureCoordinatesAABB(ivec3 coordinates, ivec3 minValue, ivec3 maxValue)
+{
+	return ((coordinates.x < minValue.x) || (coordinates.y < minValue.y) || (coordinates.z < minValue.z) ||
+	        (coordinates.x > maxValue.x) || (coordinates.y > maxValue.y) || (coordinates.z > maxValue.z));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Test whether the voxel at index indexHashed has any face set as lit
+* @param indexHashed [in] voxel index to test if it has any voxel face as lit
+* @return true if any voxel face as been set as lit, false otherwise */
+bool isVoxelLit(uint indexHashed)
+{
+	return (uint(litTestVoxelPerByte[indexHashed]) > 0);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Computes the unhashed 3D coordinates for the position given with hashed value as parameter, for a uniform
+* voxelization volume given by voxelizationWidth
+* @param value [in] value to unhash
+* @return unhashed value for parameter value */
+ivec3 unhashValue(uint value)
+{
+	float sizeFloat = g_voxelSize;
+	float number    = float(value) / sizeFloat;
+
+	ivec3 result;
+	float integerPart;
+	float fractional = modf(number, integerPart);
+	result.z         = int(fractional * sizeFloat);
+	number          /= sizeFloat;
+	fractional       = modf(number, integerPart);
+	result.y         = int(fractional * sizeFloat);
+	result.x         = int(integerPart);
+
+	return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** hashed value for texture coordinates given as parameter in a voxelization of size g_voxelSizeInt
+* @param texcoord  [in] texture coordinates
+* @return hashed value */
+uint getHashedIndex(ivec3 texcoord)
+{
+	return texcoord.x * g_voxelSizeInt * g_voxelSizeInt + texcoord.y * g_voxelSizeInt + texcoord.z;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupied if the current voxel is occupied by one voxel, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupied(uint indexHashed)
+{
+	float integerPart;
+	float indexDecimalFloat = float(indexHashed) / 32.0;
+	float fractional        = modf(indexDecimalFloat, integerPart);
+	uint index              = uint(integerPart);
+	uint bit                = uint(fractional * 32.0);
+	bool result             = ((voxelOccupied[index] & (1 << bit)) > 0);
+	return result;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////

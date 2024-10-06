@@ -1,0 +1,52 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+    const uint NUM_WORKGROUP_Y_DIMENSION = myMaterialData.localWorkGroupsYDimension;
+    uint idx                             = gl_WorkGroupID.x * NUM_WORKGROUP_Y_DIMENSION * THREAD_PER_LOCAL_WORKGROUP + gl_WorkGroupID.y * THREAD_PER_LOCAL_WORKGROUP + gl_LocalInvocationIndex;
+    g_voxelSize                          = float(myMaterialData.voxelizationResolution);
+    g_voxelSizeInt                       = int(g_voxelSize);
+    ivec3 unhashed                       = unhashValue(idx);
+    ivec3 voxelMaxCoordinates            = ivec3(g_voxelSizeInt - 1);
+    uint encodedData                     = 0;
+    uint counter                         = 0;
+
+    ivec3 tempCoordinates;
+
+    for(int i = -1; i <= 1; ++i)
+    {
+        for(int j = -1; j <= 1; ++j)
+        {
+            for(int k = -1; k <= 1; ++k)
+            {
+                tempCoordinates = unhashed + ivec3(i, j, k);
+
+                if(all(lessThanEqual(tempCoordinates, voxelMaxCoordinates)) && 
+                   all(greaterThanEqual(tempCoordinates, ivec3(0))) &&
+                   isVoxelOccupied(getHashedIndex(tempCoordinates)))
+                {
+                    encodedData |= (1 << counter);
+                }
+
+                counter++;
+            }
+        }
+    }
+
+    imageStore(staticVoxelNeighbourInfo, unhashed, uvec4(encodedData, 0, 0, 0));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

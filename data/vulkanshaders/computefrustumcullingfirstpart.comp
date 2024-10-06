@@ -1,0 +1,115 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// DEFINES
+#define RADIUS_SCALING_FACTOR 1.0 //!< Radius scaling factor for the frustum test, using the smallest possible that avoids popping of scene elements
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (binding = 0) uniform materialData
+{
+	// WARNING 4 32-bit ALLIGNMENT
+	uint localWorkGroupsXDimension;       //!< Number of dispatched local workgroups in the x dimension
+	uint localWorkGroupsYDimension;       //!< Number of dispatched local workgroups in the y dimension
+	uint numThreadExecuted;               //!< Number of threads executed
+	uint padding;                         //!< Just foor padding to have ve4 alignment in the shader
+	vec4 frustumPlaneLeftMainCamera;      //!< Frustum plane for the test
+	vec4 frustumPlaneRightMainCamera;     //!< Frustum plane for the test
+	vec4 frustumPlaneTopMainCamera;       //!< Frustum plane for the test
+	vec4 frustumPlaneBottomMainCamera;    //!< Frustum plane for the test
+	vec4 frustumPlaneBackMainCamera;      //!< Frustum plane for the test
+	vec4 frustumPlaneFrontMainCamera;     //!< Frustum plane for the test
+	vec4 frustumPlaneLeftEmitterCamera;   //!< Frustum plane for the test
+	vec4 frustumPlaneRightEmitterCamera;  //!< Frustum plane for the test
+	vec4 frustumPlaneTopEmitterCamera;    //!< Frustum plane for the test
+	vec4 frustumPlaneBottomEmitterCamera; //!< Frustum plane for the test
+	vec4 frustumPlaneBackEmitterCamera;   //!< Frustum plane for the test
+	vec4 frustumPlaneFrontEmitterCamera;  //!< Frustum plane for the test
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Struct used to store, for each scene element in vectorNodePtr, the position and bounding sphere radius */
+struct InstanceData
+{
+	vec3 position; // Position of the scene element
+	float radius;  // Radius of the bounding sphere for the scene element
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the information from ComputeFrustumCullingTechnique::m_instanceDataBuffer */
+layout (binding = 1) buffer coherent instanceDataBuffer
+{
+	InstanceData instanceData[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the amount of elements that passed the frustum culling test for the main camera */
+layout (binding = 2) buffer coherent frustumElementCounterMainCameraBuffer
+{
+	uint frustumElementCounterMainCamera;
+} myFrustumElementCounterMainCameraBuffer;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the amount of elements that passed the frustum culling test for the emitter camera */
+layout (binding = 3) buffer coherent frustumElementCounterEmitterCameraBuffer
+{
+	uint frustumElementCounterEmitterCamera;
+} myFrustumElementCounterEmitterCameraBuffer;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for debug purposes */
+layout (binding = 4) buffer coherent frustumDebugBuffer
+{
+	float frustumDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the contents of indirectCommandBuffer (the VkDrawIndexedIndirectCommand struct) */
+struct DrawIndexedIndirectCommand 
+{
+	uint indexCount;
+	uint instanceCount;
+	uint firstIndex;
+	uint vertexOffset;
+	uint firstInstance;
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Multi draw indirect command for the scene main camera */
+layout (binding = 5) buffer indirectCommandBufferMainCamera
+{
+	DrawIndexedIndirectCommand indirectCommandMainCamera[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Multi draw indirect command for the emitter main camera */
+layout (binding = 6) buffer indirectCommandBufferEmitterCamera
+{
+	DrawIndexedIndirectCommand indirectCommandEmitterCamera[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////

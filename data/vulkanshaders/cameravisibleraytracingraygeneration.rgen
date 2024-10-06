@@ -1,0 +1,397 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_shader_8bit_storage : enable
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (std140, binding = 0) uniform materialData
+{
+    mat4 viewMatrixInverse;           //!< Inverse of the view matrix
+    mat4 projectionMatrixInverse;     //!< Inverse of the projection matrix
+    vec4 cameraPosition;              //!< Main camera position
+    vec4 sceneMin;                    //!< Scene min AABB value
+    vec4 sceneExtentVoxelizationSize; //!< Scene extent and voxel size in w field
+    vec4 lightPosition;               //!< Light position in world coordinates
+    vec4 lightForward;                //!< Light direction in world coordinates
+} myMaterialData;
+
+layout(binding = 2) uniform accelerationStructureEXT raytracedaccelerationstructure;
+layout(binding = 3, rgba8) uniform image2D cameraVisibleNormal;
+layout(binding = 4, rgba8) uniform image2D cameraVisibleReflectance;
+layout(binding = 5, rgba16f) uniform image2D cameraVisiblePosition;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for debug purposes */
+layout (binding = 6) buffer coherent cameraVisibleDebugBuffer
+{
+    float cameraVisibleDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer of camera visible test static voxels having information on a per-byte approach (each byte of the buffer has information whether a 
+* dynamic voxel is vislbe from camera or not, representing each byte's index in the buffer the hashed index of a voxel's coordinates) */
+layout (binding = 7) buffer coherent cameraVisibleVoxelPerByteBuffer
+{
+    uint8_t cameraVisibleVoxelPerByte[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer of camera visible test dynamic voxels having information on a per-byte approach (each byte of the buffer has information whether a 
+* dynamic voxel is vislbe from camera or not, representing each byte's index in the buffer the hashed index of a voxel's coordinates) */
+layout (binding = 8) buffer coherent cameraVisibleDynamicVoxelPerByteBuffer
+{
+    uint8_t cameraVisibleDynamicVoxelPerByte[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for accelerating the search of elements in voxelFirstIndexCompactedBuffer and
+* voxelHashedPositionCompactedBuffer. Contains the index to the first element in
+* voxelFirstIndexCompactedBuffer and voxelHashedPositionCompactedBuffer for fixed
+* 3D voxelization values, like (0,0,0), (0,0,128), (0,1,0), (0,1,128), (0,2,0), (0,2,128), ... */
+layout (binding = 9) buffer coherent IndirectionIndexBuffer
+{
+    uint IndirectionIndex[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for accelerating the search of elements in voxelFirstIndexCompactedBuffer and
+* voxelHashedPositionCompactedBuffer. Contains the amount of elements at the same index in
+* IndirectionIndexBuffer, to know how many elements to the right are there when using the
+* value at the same index of IndirectionIndexBuffe in voxelFirstIndexCompactedBuffer */
+layout (binding = 10) buffer coherent IndirectionRankBuffer
+{
+    uint IndirectionRank[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the hashed position of the 3D volume voxelization coordinates the fragment
+* data in the same index at the voxelFirstIndexCompactedBuffer buffer
+* occupied initially in the non-compacted buffer */
+layout (binding = 11) buffer coherent voxelHashedPositionCompactedBuffer
+{
+    uint voxelHashedPositionCompacted[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 12) buffer coherent voxelOccupiedBuffer
+{
+    uint voxelOccupied[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer to know, for a given 3D voxelization volume texture (whose indices are hashed to a unique uint 32-bit)
+* if there are fragments at that position or that 3D voxelization volume is empty. */
+layout (binding = 13) buffer coherent voxelOccupiedDynamicBuffer
+{
+    uint voxelOccupiedDynamic[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Pointer to the buffer used to tag those 2^3 tiles in the voxelization volume which have at least one 
+* empty voxel that has at least one neighbour occupied static voxel that need padding to be computed */
+layout (binding = 14) buffer coherent irradiancePaddingTagTilesBuffer
+{
+    uint8_t irradiancePaddingTagTiles[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Pointer to the buffer used to tag those 2^3 tiles in the voxelization volume which have at least one 
+* occupied voxel that will be processed for filtering together with neighbouring voxels */
+layout (binding = 15) buffer coherent irradianceFilteringTagTilesBuffer
+{
+    uint8_t irradianceFilteringTagTiles[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout(binding = 16) uniform usampler3D staticVoxelIndexTexture;
+
+/** Texture with infomation at bit level on whehter neighbouring voxels are occupied by static voxels or not
+* The neighbour voxel occupied information in encoded on a 32-bit unsigned int variable with bit index detailed below:
+* bit 0:  Information for neighbour voxel at offset (-1, -1, -1)
+* bit 1:  Information for neighbour voxel at offset (-1, -1,  0)
+* bit 2:  Information for neighbour voxel at offset (-1, -1,  1)
+* bit 3:  Information for neighbour voxel at offset (-1,  0, -1)
+* bit 4:  Information for neighbour voxel at offset (-1,  0,  0)
+* bit 5:  Information for neighbour voxel at offset (-1,  0,  1)
+* bit 6:  Information for neighbour voxel at offset (-1,  1, -1)
+* bit 7:  Information for neighbour voxel at offset (-1,  1,  0)
+* bit 8:  Information for neighbour voxel at offset (-1,  1,  1)
+* bit 9:  Information for neighbour voxel at offset ( 0, -1, -1)
+* bit 10: Information for neighbour voxel at offset ( 0, -1,  0)
+* bit 11: Information for neighbour voxel at offset ( 0, -1,  1)
+* bit 12: Information for neighbour voxel at offset ( 0,  0, -1)
+* bit 13: Information for neighbour voxel at offset ( 0,  0,  0)
+* bit 14: Information for neighbour voxel at offset ( 0,  0,  1)
+* bit 15: Information for neighbour voxel at offset ( 0,  1, -1)
+* bit 16: Information for neighbour voxel at offset ( 0,  1,  0)
+* bit 17: Information for neighbour voxel at offset ( 0,  1,  1)
+* bit 18: Information for neighbour voxel at offset ( 1, -1, -1)
+* bit 19: Information for neighbour voxel at offset ( 1, -1,  0)
+* bit 20: Information for neighbour voxel at offset ( 1, -1,  1)
+* bit 21: Information for neighbour voxel at offset ( 1,  0, -1)
+* bit 22: Information for neighbour voxel at offset ( 1,  0,  0)
+* bit 23: Information for neighbour voxel at offset ( 1,  0,  1)
+* bit 24: Information for neighbour voxel at offset ( 1,  1, -1)
+* bit 25: Information for neighbour voxel at offset ( 1,  1,  0)
+* bit 26: Information for neighbour voxel at offset ( 1,  1,  1) */
+layout(binding = 17) uniform usampler3D staticVoxelNeighbourInfo;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+struct hitPayload
+{
+    vec3 hitPosition;
+    int isDynamicGeometry;
+    int anyHit;
+    vec3 reflectance;
+    vec3 normalWorld;
+    vec3 rayOrigin;
+    float mipLevelValue;
+    float value0;
+    float value1;
+    float value2;
+    float value3;
+};
+
+layout(location = 0) rayPayloadEXT hitPayload prd;
+
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+// GLOBAL VARIABLES
+float g_voxelSize;    // Size of the voxelization texture
+int   g_voxelSizeInt; // Size of the voxelization texture
+
+bool record;
+uint counter;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Use a per-bit approach to flag lit voxels for the given index, which is a hashing of the 3D voxel position.
+* @param indexHashed [in] index of the voxel to set as lit (hashed voxel's 3D texture coordinates)
+* @return true if the previous bit was not set to one, meaning this is the first call that sets t o1 the bit */
+void setStaticVoxelVisible(uint indexHashed)
+{
+    cameraVisibleVoxelPerByte[indexHashed] = uint8_t(1);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Use a per-bit approach to flag dynamic lit voxels for the given index, which is a hashing of the 3D voxel position.
+* @param indexHashed [in] index of the dynamic voxel to set as lit (hashed voxel's 3D texture coordinates)
+* @return true if the previous bit was not set to one, meaning this is the first call that sets t o1 the bit */
+void setDynamicVoxelVisible(uint indexHashed)
+{
+    cameraVisibleDynamicVoxelPerByte[indexHashed] = uint8_t(1);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+ 
+/** Computes texture space coordinates of the world coordinates given as parameter
+* @param worldCoordinates [in] world coordinates
+* @return texture space coordinates of the world coordinates given as parameter */
+ivec3 worldToVoxelSpace(vec3 worldCoordinates)
+{
+     vec3 result = worldCoordinates;
+     result     -= myMaterialData.sceneMin.xyz;
+     result     /= myMaterialData.sceneExtentVoxelizationSize.xyz;
+     result     *= myMaterialData.sceneExtentVoxelizationSize.w;
+ 
+     return ivec3(uint(result.x), uint(result.y), uint(result.z));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** hashed value for texture coordinates given as parameter in a voxelization of size g_voxelSizeInt
+* @param texcoord  [in] texture coordinates
+* @return hashed value */
+uint getHashedIndex(ivec3 texcoord)
+{
+    return texcoord.x * g_voxelSizeInt * g_voxelSizeInt + texcoord.y * g_voxelSizeInt + texcoord.z;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupied if the current voxel is occupied by at least one fragment, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupied(uint indexHashed)
+{    
+    float integerPart;
+    float indexDecimalFloat = float(indexHashed) / 32.0;
+    float fractional        = modf(indexDecimalFloat, integerPart);
+    uint index              = uint(integerPart);
+    uint bit                = uint(fractional * 32.0);
+    bool result             = ((voxelOccupied[index] & (1 << bit)) > 0);
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Returns from voxelOccupiedDynamic if the current voxel is occupied by one voxel, or false otherwise
+* @param indexHashed [in] hashed texture coordinates to test
+* @return true if voxel occupied, false otherwise */
+bool isVoxelOccupiedDynamic(uint indexHashed)
+{
+    float integerPart;
+    float indexDecimalFloat = float(indexHashed) / 32.0;
+    float fractional        = modf(indexDecimalFloat, integerPart);
+    uint index              = uint(integerPart);
+    uint bit                = uint(fractional * 32.0);
+    bool result             = ((voxelOccupiedDynamic[index] & (1 << bit)) > 0);
+
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+void main()
+{
+    const vec2 pixelCenter = vec2(gl_LaunchIDEXT.xy) + vec2(0.5);
+    const vec2 inUV        = pixelCenter / vec2(gl_LaunchSizeEXT.xy);
+    vec2  d                = inUV * 2.0 - 1.0;
+    vec4 origin            = myMaterialData.viewMatrixInverse       * vec4(0, 0, 0, 1);
+    vec4 target            = myMaterialData.projectionMatrixInverse * vec4(d.x, d.y, 1, 1);
+    vec4 direction         = myMaterialData.viewMatrixInverse       * vec4(normalize(target.xyz), 0);
+    uint  rayFlags         = gl_RayFlagsOpaqueEXT;
+    float tMin             = 0.001;
+    float tMax             = 10000.0;
+    g_voxelSize            = myMaterialData.sceneExtentVoxelizationSize.w;
+    g_voxelSizeInt         = int(g_voxelSize);
+
+    // TODO: If possible, do some of the operations in the ray hit and compare performance times.
+
+    prd.hitPosition        = vec3(0.0);
+    prd.isDynamicGeometry  = 0;
+    prd.anyHit             = 0;
+    prd.reflectance        = vec3(0.0);
+    prd.normalWorld        = vec3(0.0);
+    prd.rayOrigin          = origin.xyz;
+    prd.mipLevelValue      = 0.0;
+    prd.value0             = 0.0;
+    prd.value1             = 0.0;
+    prd.value2             = 0.0;
+    prd.value3             = 0.0;
+
+    traceRayEXT(raytracedaccelerationstructure, // acceleration structure
+              rayFlags,                       // rayFlags
+              0xFF,                           // cullMask
+              0,                              // sbtRecordOffset
+              0,                              // sbtRecordStride
+              0,                              // missIndex
+              origin.xyz,                     // ray origin
+              tMin,                           // ray min range
+              direction.xyz,                  // ray direction
+              tMax,                           // ray max range
+              0                               // payload (location = 0)
+    );
+
+    record           = false;
+    uint blockSize   = 300;
+    uint screenWidth = 770;
+    counter          = uint(gl_LaunchIDEXT.y) * screenWidth * blockSize + uint(gl_LaunchIDEXT.x) * blockSize;
+
+    bool setVoxel = false;
+    ivec3 voxelCoordinates;
+
+    if(record)
+    {
+        cameraVisibleDebug[counter++] = float(1100.0);
+        cameraVisibleDebug[counter++] = float(pixelCenter.x);
+        cameraVisibleDebug[counter++] = float(pixelCenter.y);
+        cameraVisibleDebug[counter++] = float(1200.0);
+        cameraVisibleDebug[counter++] = float(inUV.x);
+        cameraVisibleDebug[counter++] = float(inUV.y);
+        cameraVisibleDebug[counter++] = float(1400.0);
+        cameraVisibleDebug[counter++] = float(d.x);
+        cameraVisibleDebug[counter++] = float(d.y);
+        cameraVisibleDebug[counter++] = float(1500.0);
+        cameraVisibleDebug[counter++] = float(origin.x);
+        cameraVisibleDebug[counter++] = float(origin.y);
+        cameraVisibleDebug[counter++] = float(origin.z);
+        cameraVisibleDebug[counter++] = float(1600.0);
+        cameraVisibleDebug[counter++] = float(direction.x);
+        cameraVisibleDebug[counter++] = float(direction.y);
+        cameraVisibleDebug[counter++] = float(direction.z);
+        cameraVisibleDebug[counter++] = float(1700.0);
+        cameraVisibleDebug[counter++] = float(g_voxelSize);
+        cameraVisibleDebug[counter++] = float(1800.0);
+        cameraVisibleDebug[counter++] = float(prd.anyHit);
+        cameraVisibleDebug[counter++] = float(1900.0);
+        cameraVisibleDebug[counter++] = float(prd.hitPosition.x);
+        cameraVisibleDebug[counter++] = float(prd.hitPosition.y);
+        cameraVisibleDebug[counter++] = float(prd.hitPosition.z);
+        cameraVisibleDebug[counter++] = float(1950.0);
+        cameraVisibleDebug[counter++] = float(prd.isDynamicGeometry);
+        cameraVisibleDebug[counter++] = float(1975.0);
+    }
+
+    if(prd.anyHit == 1)
+    {
+        voxelCoordinates = worldToVoxelSpace(prd.hitPosition);
+        setVoxel = true;
+    }
+
+    if(setVoxel)
+    {
+        // Test whether both static and dynamic voxels are present for this texture coordinates and tag them if it is the case, sometimes a single ray will hit parts of the scene which both have static and dynamic voxels
+
+        uint hashedIndex = getHashedIndex(voxelCoordinates);
+
+        vec4 normalWorldShadow = vec4(prd.normalWorld, 0.0);
+        normalWorldShadow.w = 1.0;
+
+        float dynamicFlag = 0.0;
+
+        if(prd.isDynamicGeometry == 1)
+        {
+            setDynamicVoxelVisible(hashedIndex);
+            dynamicFlag = 1.0;
+        }
+        else if(isVoxelOccupied(hashedIndex))
+        {
+            setStaticVoxelVisible(hashedIndex);
+        }
+
+        imageStore(cameraVisibleNormal,      ivec2(gl_LaunchIDEXT.xy), normalWorldShadow);
+        imageStore(cameraVisiblePosition,    ivec2(gl_LaunchIDEXT.xy), vec4(prd.value0, prd.value1, prd.value2, prd.value3));
+        imageStore(cameraVisibleReflectance, ivec2(gl_LaunchIDEXT.xy), vec4(prd.reflectance, dynamicFlag));
+    }
+    else
+    {
+        imageStore(cameraVisibleNormal,      ivec2(gl_LaunchIDEXT.xy), vec4(0.0));
+        imageStore(cameraVisiblePosition,    ivec2(gl_LaunchIDEXT.xy), vec4(0.0));
+        imageStore(cameraVisibleReflectance, ivec2(gl_LaunchIDEXT.xy), vec4(0.0));
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////

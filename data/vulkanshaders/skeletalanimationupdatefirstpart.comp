@@ -1,0 +1,109 @@
+/*
+Copyright 2024 Alejandro Cosin
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (std140, binding = 0) uniform sceneElementTransform
+{
+    mat4 model;
+} mySceneElementTransform;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+layout (std140, binding = 1) uniform materialData
+{
+	// WARNING 4 32-bit ALLIGNMENT
+    // TODO: Use push constant in different dispatches? Otherwise put in a buffer the values in boneMatrixIndexLimit, boneMatrixOffset and sceneLoadTransformN to allow a bigger number of updates
+	uint  localWorkGroupsXDimension; //!< Number of dispatched local workgroups in the x dimension
+	uint  localWorkGroupsYDimension; //!< Number of dispatched local workgroups in the y dimension
+} myMaterialData;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the skeletal mesh vertex information to be updated */
+layout (binding = 2) buffer coherent vertexBufferSkinnedMesh
+{
+	uint vertexBufferSkinnedMeshData[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the original, T-pose skeletal mesh vertex information used for the update in vertexBufferSkinnedMesh */
+layout (binding = 3) buffer coherent vertexBufferSkinnedMeshOriginal
+{
+    uint vertexBufferSkinnedMeshOriginalData[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer with the bone ID and the bone weight data for each vertex in vertexBufferSkinnedMeshOriginal and vertexBufferSkinnedMesh,
+* currently up to 4 bones and weights are implemented per vertex, the information in this buffer is 8 float values per vertex data in vertexBufferSkinnedMesh and 
+* vertexBufferSkinnedMeshOriginal with the first four being bone ID information and the remaining four being weight information */
+layout (binding = 4) buffer coherent skinnedMeshDataBuffer
+{
+    float skinnedMeshDataBufferData[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer containing the matrices with the pose information used by each skeletal mesh to be updated */
+layout (binding = 5) buffer coherent poseMatrixBuffer
+{
+    mat4 poseMatrix[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for debug purposes */
+layout (binding = 6) buffer coherent skeletalMeshDebugBuffer
+{
+    double skeletalMeshDebug[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Buffer for debug purposes */
+layout (binding = 7) buffer coherent sceneLoadTransformBuffer
+{
+    mat4 sceneLoadTransform[ ];
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Push constant to know what is the offset in the buffer poseMatrix for the current dispatch and 
+* with the amount of vertices to process for the current skeletal mesh to be updated */
+layout(push_constant) uniform pushConstant
+{
+    vec4 pushConstantData;
+} myPushConstant;
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+vec3 convRGB8ToVec(uint val)
+{
+    return vec3(float((val&0x000000FF)), float((val&0x0000FF00)>>8U), float ((val&0x00FF0000)>>16U)); // TODO: Review offset, might be wrong and needs to be fixed at vertex level
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
+
+uint convVecToRGB8(vec3 val)
+{
+    uint result = (uint(val.x) | (uint(val.y) << 8) | (uint(val.z) << 16));
+    return result;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////
