@@ -3,7 +3,7 @@ Dynamic voxel-based global illumination
 
 ![Teaser](teaser.png)
 
-**NOTE: This project has been moved to https://Alex_Storm_@bitbucket.org/Alex_Storm_/dvbgi please visit the new URL to access the whole project including source code and test scene**
+**NOTE: This project has been moved to https://bitbucket.org/Alex_Storm_/dvbgi please visit the new URL to access the whole project including source code and test scene**
 
 This project contains a full implementation of the Dynamic voxel-based global illumination technique ( https://onlinelibrary.wiley.com/doi/10.1111/cgf.15262 ), including all the graphics framework written in C++ and Vulkan, and all the shaders needed for the technique.
 **Disclaimer: This is an academic implementation, many parts can be largely improved, refactored, and there might be Vulkan validation layer errors pending to fix. It has only been tested on a NVIDIA RTX 2060 GPU.**
